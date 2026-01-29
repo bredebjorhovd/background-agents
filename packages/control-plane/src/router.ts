@@ -71,6 +71,8 @@ const PUBLIC_ROUTES: RegExp[] = [/^\/health$/];
  */
 const SANDBOX_AUTH_ROUTES: RegExp[] = [
   /^\/sessions\/[^/]+\/pr$/, // PR creation from sandbox
+  /^\/sessions\/[^/]+\/artifacts$/, // Artifact upload (screenshot, preview) from sandbox
+  /^\/sessions\/[^/]+\/preview-url$/, // Get preview tunnel URL (sandbox)
 ];
 
 /**
@@ -217,6 +219,21 @@ const routes: Route[] = [
     handler: handleSessionArtifacts,
   },
   {
+    method: "POST",
+    pattern: parsePattern("/sessions/:id/artifacts"),
+    handler: handlePostArtifact,
+  },
+  {
+    method: "GET",
+    pattern: parsePattern("/sessions/:id/artifacts/:artifactId/file"),
+    handler: handleGetArtifactFile,
+  },
+  {
+    method: "GET",
+    pattern: parsePattern("/sessions/:id/preview-url"),
+    handler: handleGetPreviewUrl,
+  },
+  {
     method: "GET",
     pattern: parsePattern("/sessions/:id/participants"),
     handler: handleSessionParticipants,
@@ -299,7 +316,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       // HMAC auth failed - check if this route accepts sandbox auth
       if (isSandboxAuthRoute(path)) {
         // Extract session ID from path (e.g., /sessions/abc123/pr -> abc123)
-        const sessionIdMatch = path.match(/^\/sessions\/([^/]+)\//);
+        // Match /sessions/:id/... or /sessions/:id (e.g. /sessions/abc123/artifacts)
+        const sessionIdMatch = path.match(/^\/sessions\/([^/]+)(?:\/|$)/);
         if (sessionIdMatch) {
           const sessionId = sessionIdMatch[1];
           const sandboxAuthError = await verifySandboxAuth(request, env, sessionId);
@@ -602,6 +620,56 @@ async function handleSessionArtifacts(
   if (!stub) return error("Session ID required");
 
   return stub.fetch(new Request("http://internal/internal/artifacts"));
+}
+
+async function handlePostArtifact(
+  request: Request,
+  env: Env,
+  match: RegExpMatchArray
+): Promise<Response> {
+  const sessionId = match.groups?.id;
+  if (!sessionId) return error("Session ID required");
+
+  const doId = env.SESSION.idFromName(sessionId);
+  const stub = env.SESSION.get(doId);
+
+  const url = new URL(request.url);
+  const internalUrl = `http://internal/internal/artifacts${url.search}`;
+  const forwarded = new Request(internalUrl, {
+    method: "POST",
+    headers: request.headers,
+    body: request.body,
+  });
+  return stub.fetch(forwarded);
+}
+
+async function handleGetArtifactFile(
+  request: Request,
+  env: Env,
+  match: RegExpMatchArray
+): Promise<Response> {
+  const sessionId = match.groups?.id;
+  const artifactId = match.groups?.artifactId;
+  if (!sessionId || !artifactId) return error("Session ID and artifact ID required");
+
+  const doId = env.SESSION.idFromName(sessionId);
+  const stub = env.SESSION.get(doId);
+
+  const url = new URL(request.url);
+  return stub.fetch(
+    new Request(`http://internal/internal/artifacts/${artifactId}/file${url.search}`)
+  );
+}
+
+async function handleGetPreviewUrl(
+  _request: Request,
+  env: Env,
+  match: RegExpMatchArray
+): Promise<Response> {
+  const stub = getSessionStub(env, match);
+  if (!stub) return error("Session ID required");
+
+  return stub.fetch(new Request("http://internal/internal/preview-url"));
 }
 
 async function handleSessionParticipants(

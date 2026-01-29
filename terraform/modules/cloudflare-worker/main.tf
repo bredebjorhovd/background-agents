@@ -10,6 +10,12 @@ locals {
       name         = kv.binding_name
       namespace_id = kv.namespace_id
     }],
+    # R2 bucket bindings
+    [for r2 in var.r2_buckets : {
+      type        = "r2_bucket"
+      name        = r2.binding_name
+      bucket_name = r2.bucket_name
+    }],
     # Service bindings (only when enabled - disable if target workers don't exist yet)
     var.enable_service_bindings ? [for svc in var.service_bindings : {
       type    = "service"

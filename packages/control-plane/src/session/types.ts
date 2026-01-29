@@ -91,6 +91,7 @@ export interface SandboxRow {
   last_heartbeat: number | null;
   last_activity: number | null; // Last activity timestamp for inactivity-based snapshot
   created_at: number;
+  preview_tunnel_url: string | null; // Public URL for live preview (port 5173)
 }
 
 // Command types for sandbox communication

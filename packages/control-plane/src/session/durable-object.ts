@@ -150,6 +150,11 @@ export class SessionDO extends DurableObject<Env> {
     { method: "GET", path: "/internal/events", handler: (_, url) => this.handleListEvents(url) },
     { method: "GET", path: "/internal/artifacts", handler: () => this.handleListArtifacts() },
     {
+      method: "POST",
+      path: "/internal/artifacts",
+      handler: (req) => this.handlePostArtifact(req),
+    },
+    {
       method: "GET",
       path: "/internal/messages",
       handler: (_, url) => this.handleListMessages(url),
@@ -167,6 +172,7 @@ export class SessionDO extends DurableObject<Env> {
       path: "/internal/verify-sandbox-token",
       handler: (req) => this.handleVerifySandboxToken(req),
     },
+    { method: "GET", path: "/internal/preview-url", handler: () => this.handleGetPreviewUrl() },
   ];
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -222,6 +228,13 @@ export class SessionDO extends DurableObject<Env> {
     // WebSocket upgrade (special case - header-based, not path-based)
     if (request.headers.get("Upgrade") === "websocket") {
       return this.handleWebSocketUpgrade(request, url);
+    }
+
+    // Dynamic route: GET /internal/artifacts/:artifactId/file (serve screenshot from R2)
+    const artifactFileMatch = path.match(/^\/internal\/artifacts\/([^/]+)\/file$/);
+    if (request.method === "GET" && artifactFileMatch) {
+      const artifactId = artifactFileMatch[1];
+      return this.handleGetArtifactFile(artifactId);
     }
 
     // Match route from table
@@ -1712,6 +1725,37 @@ export class SessionDO extends DurableObject<Env> {
         console.log(`[DO] Stored modal_object_id: ${result.modalObjectId}`);
       }
 
+      // Store preview tunnel URL and create preview artifact if available
+      if (result.previewTunnelUrl) {
+        this.sql.exec(
+          `UPDATE sandbox SET preview_tunnel_url = ? WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
+          result.previewTunnelUrl
+        );
+        console.log(`[DO] Stored preview_tunnel_url`);
+        const session = this.getSession();
+        if (session) {
+          const artifactId = generateId();
+          const now = Date.now();
+          this.sql.exec(
+            `INSERT INTO artifacts (id, type, url, metadata, created_at) VALUES (?, ?, ?, ?, ?)`,
+            artifactId,
+            "preview",
+            result.previewTunnelUrl,
+            JSON.stringify({ previewStatus: "active" }),
+            now
+          );
+          this.broadcast({
+            type: "artifact_created",
+            artifact: {
+              id: artifactId,
+              type: "preview",
+              url: result.previewTunnelUrl,
+              metadata: { previewStatus: "active" },
+            },
+          });
+        }
+      }
+
       this.updateSandboxStatus("connecting");
       this.broadcast({ type: "sandbox_status", status: "connecting" });
 
@@ -2394,6 +2438,207 @@ export class SessionDO extends DurableObject<Env> {
         createdAt: a.created_at,
       })),
     });
+  }
+
+  private static readonly MAX_ARTIFACT_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
+
+  /**
+   * Handle artifact upload (screenshot via multipart, preview via JSON).
+   * Screenshots are stored in R2; artifact url is the Worker serve URL.
+   */
+  private async handlePostArtifact(request: Request): Promise<Response> {
+    const session = this.getSession();
+    if (!session) {
+      return Response.json({ error: "Session not found" }, { status: 404 });
+    }
+
+    const sessionId = session.session_name || session.id;
+    const workerUrl = this.env.WORKER_URL || this.env.WEB_APP_URL || "";
+    const contentType = request.headers.get("Content-Type") || "";
+
+    try {
+      if (contentType.includes("application/json")) {
+        const body = (await request.json()) as {
+          type: string;
+          url?: string;
+          metadata?: Record<string, unknown>;
+        };
+        if (!body.type) {
+          return Response.json({ error: "type is required" }, { status: 400 });
+        }
+        if (body.type !== "preview" && body.type !== "branch" && body.type !== "screenshot") {
+          return Response.json(
+            { error: "type must be preview, branch, or screenshot" },
+            { status: 400 }
+          );
+        }
+        if ((body.type === "preview" || body.type === "branch") && !body.url) {
+          return Response.json({ error: "url is required for preview/branch" }, { status: 400 });
+        }
+
+        const artifactId = generateId();
+        const now = Date.now();
+        const url = body.url || null;
+        const metadata = body.metadata ? JSON.stringify(body.metadata) : null;
+
+        this.sql.exec(
+          `INSERT INTO artifacts (id, type, url, metadata, created_at) VALUES (?, ?, ?, ?, ?)`,
+          artifactId,
+          body.type,
+          url,
+          metadata,
+          now
+        );
+
+        this.broadcast({
+          type: "artifact_created",
+          artifact: {
+            id: artifactId,
+            type: body.type,
+            url: url ?? undefined,
+            metadata: body.metadata,
+          },
+        });
+
+        return Response.json({ id: artifactId, type: body.type, url });
+      }
+
+      if (contentType.includes("multipart/form-data")) {
+        const r2 = this.env.R2_ARTIFACTS;
+        if (!r2) {
+          return Response.json({ error: "R2_ARTIFACTS not configured" }, { status: 503 });
+        }
+
+        const contentLength = request.headers.get("Content-Length");
+        if (contentLength && parseInt(contentLength, 10) > SessionDO.MAX_ARTIFACT_BODY_BYTES) {
+          return Response.json(
+            { error: `Body too large (max ${SessionDO.MAX_ARTIFACT_BODY_BYTES / 1024 / 1024} MB)` },
+            { status: 413 }
+          );
+        }
+
+        const formData = await request.formData();
+        const file = formData.get("file") as File | null;
+        const typeField = formData.get("type") as string | null;
+        const metadataStr = formData.get("metadata") as string | null;
+
+        if (!file || typeof file.arrayBuffer !== "function") {
+          return Response.json({ error: "file part is required (multipart)" }, { status: 400 });
+        }
+
+        const artifactType = (typeField as string) || "screenshot";
+        if (artifactType !== "screenshot") {
+          return Response.json(
+            { error: "multipart upload is only for type screenshot" },
+            { status: 400 }
+          );
+        }
+
+        const bytes = await file.arrayBuffer();
+        if (bytes.byteLength > SessionDO.MAX_ARTIFACT_BODY_BYTES) {
+          return Response.json(
+            { error: `File too large (max ${SessionDO.MAX_ARTIFACT_BODY_BYTES / 1024 / 1024} MB)` },
+            { status: 413 }
+          );
+        }
+
+        const artifactId = generateId();
+        const r2Key = `sessions/${session.id}/${artifactId}.png`;
+
+        await r2.put(r2Key, bytes, {
+          httpMetadata: { contentType: file.type || "image/png" },
+        });
+
+        const serveUrl = `${workerUrl}/sessions/${sessionId}/artifacts/${artifactId}/file`;
+        const metadataObj: Record<string, unknown> = metadataStr ? JSON.parse(metadataStr) : {};
+        metadataObj.r2_key = r2Key;
+
+        const now = Date.now();
+        this.sql.exec(
+          `INSERT INTO artifacts (id, type, url, metadata, created_at) VALUES (?, ?, ?, ?, ?)`,
+          artifactId,
+          "screenshot",
+          serveUrl,
+          JSON.stringify(metadataObj),
+          now
+        );
+
+        this.broadcast({
+          type: "artifact_created",
+          artifact: { id: artifactId, type: "screenshot", url: serveUrl },
+        });
+
+        return Response.json({ id: artifactId, type: "screenshot", url: serveUrl });
+      }
+
+      return Response.json(
+        { error: "Content-Type must be application/json or multipart/form-data" },
+        { status: 400 }
+      );
+    } catch (e) {
+      console.error("[DO] handlePostArtifact error:", e);
+      return Response.json(
+        { error: e instanceof Error ? e.message : "Failed to create artifact" },
+        { status: 500 }
+      );
+    }
+  }
+
+  /**
+   * Return the preview tunnel URL for this session (GET /sessions/:id/preview-url).
+   * Used by the start-preview tool so the agent can tell the user the URL.
+   */
+  private handleGetPreviewUrl(): Response {
+    const sandbox = this.getSandbox();
+    const url = sandbox?.preview_tunnel_url ?? null;
+    return Response.json({ url });
+  }
+
+  /**
+   * Serve screenshot file from R2 (GET /sessions/:id/artifacts/:artifactId/file).
+   */
+  private async handleGetArtifactFile(artifactId: string): Promise<Response> {
+    const r2 = this.env.R2_ARTIFACTS;
+    if (!r2) {
+      return new Response("R2 not configured", { status: 503 });
+    }
+
+    const result = this.sql.exec(
+      `SELECT id, type, metadata FROM artifacts WHERE id = ? LIMIT 1`,
+      artifactId
+    );
+    const rows = result.toArray() as unknown as Array<{
+      id: string;
+      type: string;
+      metadata: string | null;
+    }>;
+    if (rows.length === 0) {
+      return new Response("Not Found", { status: 404 });
+    }
+
+    const row = rows[0];
+    if (row.type !== "screenshot") {
+      return new Response("Not Found", { status: 404 });
+    }
+
+    const metadata = row.metadata ? JSON.parse(row.metadata) : {};
+    const r2Key = metadata.r2_key as string | undefined;
+    if (!r2Key) {
+      return new Response("Artifact has no storage key", { status: 500 });
+    }
+
+    const object = await r2.get(r2Key);
+    if (!object) {
+      return new Response("Not Found", { status: 404 });
+    }
+
+    const headers = new Headers();
+    const contentType = object.httpMetadata?.contentType ?? "image/png";
+    headers.set("Content-Type", contentType);
+    if (object.etag) headers.set("ETag", object.etag);
+    if (object.size) headers.set("Content-Length", String(object.size));
+
+    return new Response(object.body, { status: 200, headers });
   }
 
   private handleListMessages(url: URL): Response {

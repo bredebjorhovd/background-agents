@@ -10,6 +10,9 @@ export interface Env {
   // KV Namespaces
   SESSION_INDEX: KVNamespace; // Index for listing sessions
 
+  // R2 Buckets (optional - for screenshot/artifact storage)
+  R2_ARTIFACTS?: R2Bucket;
+
   // Service bindings
   SLACK_BOT?: Fetcher; // Optional - only if slack-bot is deployed
 

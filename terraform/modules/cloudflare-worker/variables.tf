@@ -28,6 +28,15 @@ variable "kv_namespaces" {
   default = []
 }
 
+variable "r2_buckets" {
+  description = "List of R2 bucket bindings"
+  type = list(object({
+    binding_name = string
+    bucket_name  = string
+  }))
+  default = []
+}
+
 variable "service_bindings" {
   description = "List of service bindings for worker-to-worker communication"
   type = list(object({

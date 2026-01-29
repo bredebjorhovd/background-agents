@@ -165,6 +165,7 @@ async def api_create_sandbox(
                 "modal_object_id": handle.modal_object_id,  # Modal's internal ID for snapshot API
                 "status": handle.status.value,
                 "created_at": handle.created_at,
+                "preview_tunnel_url": handle.preview_tunnel_url,
             },
         }
     except Exception as e:

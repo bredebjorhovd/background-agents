@@ -41,6 +41,18 @@ module "slack_kv" {
 }
 
 # =============================================================================
+# Cloudflare R2 (artifacts / screenshots)
+# =============================================================================
+
+module "artifacts_r2" {
+  source = "../../modules/cloudflare-r2"
+
+  account_id  = var.cloudflare_account_id
+  bucket_name = "open-inspect-artifacts-${local.name_suffix}"
+  location    = "ENAM"
+}
+
+# =============================================================================
 # Cloudflare Workers
 # =============================================================================
 
@@ -69,6 +81,13 @@ module "control_plane_worker" {
     {
       binding_name = "SESSION_INDEX"
       namespace_id = module.session_index_kv.namespace_id
+    }
+  ]
+
+  r2_buckets = [
+    {
+      binding_name = "R2_ARTIFACTS"
+      bucket_name  = module.artifacts_r2.bucket_name
     }
   ]
 
@@ -112,7 +131,7 @@ module "control_plane_worker" {
   compatibility_flags = ["nodejs_compat"]
   migration_tag       = "v1"
 
-  depends_on = [null_resource.control_plane_build, module.session_index_kv]
+  depends_on = [null_resource.control_plane_build, module.session_index_kv, module.artifacts_r2]
 }
 
 # Build slack-bot worker bundle (only runs during apply, not plan)

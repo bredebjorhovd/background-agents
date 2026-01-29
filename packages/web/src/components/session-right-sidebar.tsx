@@ -7,6 +7,7 @@ import {
   MetadataSection,
   TasksSection,
   FilesChangedSection,
+  ArtifactsSection,
 } from "./sidebar";
 import { extractLatestTasks } from "@/lib/tasks";
 import type { Artifact, FileChange } from "@/types/session";
@@ -101,6 +102,13 @@ export function SessionRightSidebar({
       {filesChanged.length > 0 && (
         <CollapsibleSection title="Files changed" defaultOpen={true}>
           <FilesChangedSection files={filesChanged} />
+        </CollapsibleSection>
+      )}
+
+      {/* Artifacts (PR, screenshots, preview) */}
+      {artifacts.length > 0 && (
+        <CollapsibleSection title="Artifacts" defaultOpen={true}>
+          <ArtifactsSection artifacts={artifacts} />
         </CollapsibleSection>
       )}
 

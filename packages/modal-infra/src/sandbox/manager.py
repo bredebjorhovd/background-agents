@@ -36,6 +36,10 @@ class SandboxConfig:
     github_app_token: str | None = None  # GitHub App token for git operations
 
 
+# Default port for live preview (Vite, etc.)
+PREVIEW_PORT = 5173
+
+
 @dataclass
 class SandboxHandle:
     """Handle to a running or warm sandbox."""
@@ -46,6 +50,7 @@ class SandboxHandle:
     created_at: float
     snapshot_id: str | None = None
     modal_object_id: str | None = None  # Modal's internal sandbox ID for API calls
+    preview_tunnel_url: str | None = None  # Public URL for port 5173 (live preview)
 
     def get_logs(self) -> str:
         """Get sandbox logs."""
@@ -121,8 +126,7 @@ class SandboxManager:
             # Use base image (would be repo-specific in production)
             image = base_image
 
-        # Create the sandbox
-        # The entrypoint command is passed as positional args
+        # Create the sandbox with preview port forwarded (Vite default 5173)
         sandbox = modal.Sandbox.create(
             "python",
             "-m",
@@ -133,6 +137,7 @@ class SandboxManager:
             timeout=int(config.timeout_hours * 3600),
             workdir="/workspace",
             env=env_vars,
+            encrypted_ports=[PREVIEW_PORT],
             # Note: volumes parameter is not supported in Sandbox.create
         )
 
@@ -142,6 +147,18 @@ class SandboxManager:
             f"[manager] Created sandbox: sandbox_id={sandbox_id}, modal_object_id={modal_object_id}"
         )
 
+        # Get tunnel URL for preview port (may take a moment to be ready)
+        preview_tunnel_url = None
+        try:
+            tunnels = sandbox.tunnels()
+            if PREVIEW_PORT in tunnels:
+                preview_tunnel_url = tunnels[PREVIEW_PORT].url
+                print(f"[manager] Preview tunnel URL: {preview_tunnel_url}")
+            else:
+                print(f"[manager] No tunnel for port {PREVIEW_PORT} in {list(tunnels.keys())}")
+        except Exception as e:
+            print(f"[manager] Failed to get preview tunnel URL: {e}")
+
         return SandboxHandle(
             sandbox_id=sandbox_id,
             modal_sandbox=sandbox,
@@ -149,6 +166,7 @@ class SandboxManager:
             created_at=time.time(),
             snapshot_id=config.snapshot_id,
             modal_object_id=modal_object_id,
+            preview_tunnel_url=preview_tunnel_url,
         )
 
     async def warm_sandbox(

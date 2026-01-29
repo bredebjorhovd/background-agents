@@ -164,4 +164,7 @@ export function initSchema(sql: SqlStorage): void {
 
   // Migration: Add callback_context column to messages table for Slack follow-up notifications
   runMigration(sql, `ALTER TABLE messages ADD COLUMN callback_context TEXT`);
+
+  // Migration: Add preview_tunnel_url column to sandbox table for live preview
+  runMigration(sql, `ALTER TABLE sandbox ADD COLUMN preview_tunnel_url TEXT`);
 }
