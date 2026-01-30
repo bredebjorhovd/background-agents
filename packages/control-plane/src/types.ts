@@ -90,6 +90,17 @@ export type ClientMessage =
       cursor?: { line: number; file: string };
     };
 
+// Stream frame data for real-time screenshot streaming
+export interface StreamFrame {
+  frameNumber: number;
+  frameHash: string;
+  timestamp: number;
+  imageData: string; // Base64-encoded image
+  imageType: "jpeg" | "png";
+  width: number;
+  height: number;
+}
+
 // Server → Client messages
 export type ServerMessage =
   | { type: "pong"; timestamp: number }
@@ -113,13 +124,20 @@ export type ServerMessage =
   | { type: "error"; code: string; message: string }
   | {
       type: "artifact_created";
-      artifact: { id: string; type: string; url: string; prNumber?: number };
+      artifact: {
+        id: string;
+        type: string;
+        url: string;
+        prNumber?: number;
+        metadata?: Record<string, unknown>;
+      };
     }
   | { type: "snapshot_saved"; imageId: string; reason: string }
   | { type: "sandbox_restored"; message: string }
   | { type: "sandbox_warning"; message: string }
   | { type: "session_status"; status: SessionStatus }
-  | { type: "processing_status"; isProcessing: boolean };
+  | { type: "processing_status"; isProcessing: boolean }
+  | { type: "stream_frame"; frame: StreamFrame };
 
 // Sandbox events (from Modal)
 export type SandboxEvent =
@@ -180,6 +198,20 @@ export type SandboxEvent =
   | {
       type: "push_error";
       branchName: string;
+      error: string;
+      sandboxId?: string;
+      timestamp?: number;
+    }
+  | {
+      type: "getElementAtPointResponse";
+      requestId: string;
+      element: unknown;
+      sandboxId?: string;
+      timestamp?: number;
+    }
+  | {
+      type: "getElementAtPointError";
+      requestId: string;
       error: string;
       sandboxId?: string;
       timestamp?: number;

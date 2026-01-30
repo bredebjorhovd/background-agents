@@ -9,6 +9,7 @@ export interface Artifact {
     prState?: "open" | "merged" | "closed" | "draft";
     filename?: string;
     previewStatus?: "active" | "outdated" | "stopped";
+    tunnelUrls?: Record<string, string>;
   };
   createdAt: number;
 }

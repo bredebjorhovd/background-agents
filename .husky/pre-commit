@@ -1,1 +1,12 @@
+# Ensure PATH includes common locations for tools (ruff, eslint, prettier)
+# when running from GUI apps that inherit a minimal environment
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+# Add Python Framework path (where pip install ruff goes on macOS)
+for pyver in 3.14 3.13 3.12 3.11; do
+  if [ -d "/Library/Frameworks/Python.framework/Versions/$pyver/bin" ]; then
+    export PATH="/Library/Frameworks/Python.framework/Versions/$pyver/bin:$PATH"
+    break
+  fi
+done
+
 npx lint-staged

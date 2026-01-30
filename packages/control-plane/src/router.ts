@@ -62,7 +62,10 @@ function getSessionStub(env: Env, match: RegExpMatchArray): DurableObjectStub | 
 /**
  * Routes that do not require authentication.
  */
-const PUBLIC_ROUTES: RegExp[] = [/^\/health$/];
+const PUBLIC_ROUTES: RegExp[] = [
+  /^\/health$/,
+  /^\/sessions\/[^/]+\/artifacts\/[^/]+\/file$/, // Artifact files (screenshots) are public
+];
 
 /**
  * Routes that accept sandbox authentication.
@@ -73,6 +76,7 @@ const SANDBOX_AUTH_ROUTES: RegExp[] = [
   /^\/sessions\/[^/]+\/pr$/, // PR creation from sandbox
   /^\/sessions\/[^/]+\/artifacts$/, // Artifact upload (screenshot, preview) from sandbox
   /^\/sessions\/[^/]+\/preview-url$/, // Get preview tunnel URL (sandbox)
+  /^\/sessions\/[^/]+\/stream-frame$/, // Screenshot stream frames from sandbox
 ];
 
 /**
@@ -234,6 +238,11 @@ const routes: Route[] = [
     handler: handleGetPreviewUrl,
   },
   {
+    method: "POST",
+    pattern: parsePattern("/sessions/:id/stream-frame"),
+    handler: handleStreamFrame,
+  },
+  {
     method: "GET",
     pattern: parsePattern("/sessions/:id/participants"),
     handler: handleSessionParticipants,
@@ -267,6 +276,11 @@ const routes: Route[] = [
     method: "POST",
     pattern: parsePattern("/sessions/:id/unarchive"),
     handler: handleUnarchiveSession,
+  },
+  {
+    method: "POST",
+    pattern: parsePattern("/sessions/:id/element-at-point"),
+    handler: handleSessionElementAtPoint,
   },
 
   // Repository management
@@ -662,14 +676,37 @@ async function handleGetArtifactFile(
 }
 
 async function handleGetPreviewUrl(
-  _request: Request,
+  request: Request,
   env: Env,
   match: RegExpMatchArray
 ): Promise<Response> {
   const stub = getSessionStub(env, match);
   if (!stub) return error("Session ID required");
 
-  return stub.fetch(new Request("http://internal/internal/preview-url"));
+  // Forward query params for port-specific URLs
+  const url = new URL(request.url);
+  const internalUrl = new URL("http://internal/internal/preview-url");
+  internalUrl.search = url.search;
+
+  return stub.fetch(new Request(internalUrl.toString()));
+}
+
+async function handleStreamFrame(
+  request: Request,
+  env: Env,
+  match: RegExpMatchArray
+): Promise<Response> {
+  const stub = getSessionStub(env, match);
+  if (!stub) return error("Session ID required");
+
+  // Forward the stream frame to the Durable Object
+  return stub.fetch(
+    new Request("http://internal/internal/stream-frame", {
+      method: "POST",
+      headers: request.headers,
+      body: request.body,
+    })
+  );
 }
 
 async function handleSessionParticipants(
@@ -808,6 +845,57 @@ async function handleSessionWsToken(
   );
 
   return response;
+}
+
+async function handleSessionElementAtPoint(
+  request: Request,
+  env: Env,
+  match: RegExpMatchArray
+): Promise<Response> {
+  const sessionId = match.groups?.id;
+  if (!sessionId) return error("Session ID required");
+
+  let body: { x: number; y: number; viewportWidth?: number; viewportHeight?: number };
+  try {
+    body = (await request.json()) as {
+      x: number;
+      y: number;
+      viewportWidth?: number;
+      viewportHeight?: number;
+    };
+  } catch {
+    return error("Invalid JSON body", 400);
+  }
+  if (typeof body.x !== "number" || typeof body.y !== "number") {
+    return error("x and y (numbers) required", 400);
+  }
+
+  const stub = getSessionStub(env, match);
+  if (!stub) return error("Session ID required");
+
+  const payload: { x: number; y: number; viewportWidth?: number; viewportHeight?: number } = {
+    x: body.x,
+    y: body.y,
+  };
+  if (typeof body.viewportWidth === "number" && typeof body.viewportHeight === "number") {
+    payload.viewportWidth = body.viewportWidth;
+    payload.viewportHeight = body.viewportHeight;
+  }
+  const response = await stub.fetch(
+    new Request("http://internal/internal/element-at-point", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+  );
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ error: response.statusText }));
+    return json(err, response.status);
+  }
+
+  const data = await response.json();
+  return json(data);
 }
 
 async function handleArchiveSession(

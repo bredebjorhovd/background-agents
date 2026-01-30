@@ -9,8 +9,25 @@ import { ToolCallGroup } from "@/components/tool-call-group";
 import { SidebarLayout, useSidebarContext } from "@/components/sidebar-layout";
 import { SessionRightSidebar } from "@/components/session-right-sidebar";
 import { ActionBar } from "@/components/action-bar";
+import { PreviewPanel, type SelectedElementInfo } from "@/components/preview-panel";
+import { VSCodePanel } from "@/components/vscode-panel";
+import { AgentViewPanel } from "@/components/agent-view-panel";
 import { formatModelNameLower } from "@/lib/format";
 import type { SandboxEvent } from "@/lib/tool-formatters";
+
+// Tab types for the main content area
+type MainTab = "chat" | "preview" | "code" | "agent-view";
+
+// Stream frame type (matches control-plane types)
+interface StreamFrame {
+  frameNumber: number;
+  frameHash: string;
+  timestamp: number;
+  imageData: string;
+  imageType: "jpeg" | "png";
+  width: number;
+  height: number;
+}
 
 // Event grouping types
 type EventGroup =
@@ -131,6 +148,8 @@ export default function SessionPage() {
     artifacts,
     currentParticipantId,
     isProcessing,
+    latestStreamFrame,
+    isStreaming,
     sendPrompt,
     stopExecution,
     sendTyping,
@@ -166,10 +185,27 @@ export default function SessionPage() {
   const [prompt, setPrompt] = useState("");
   const [selectedModel, setSelectedModel] = useState("claude-haiku-4-5");
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<MainTab>("chat");
+  const [selectedElement, setSelectedElement] = useState<SelectedElementInfo | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
+
+  // Auto-switch to preview tab when preview artifact becomes available
+  const previewArtifact = artifacts.find((a) => a.type === "preview");
+  const prevPreviewUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    const currentUrl = previewArtifact?.url || null;
+    // Only auto-switch when preview URL is first set (not on subsequent updates)
+    if (currentUrl && !prevPreviewUrlRef.current) {
+      // Don't auto-switch if user is actively typing
+      if (!prompt.trim()) {
+        setActiveTab("preview");
+      }
+    }
+    prevPreviewUrlRef.current = currentUrl;
+  }, [previewArtifact?.url, prompt]);
 
   // Scroll to bottom when new content arrives
   useEffect(() => {
@@ -198,8 +234,12 @@ export default function SessionPage() {
     e.preventDefault();
     if (!prompt.trim() || isProcessing) return;
 
-    sendPrompt(prompt, selectedModel);
+    const content = selectedElement
+      ? `[Context: User selected element on preview]\n\nElement: ${selectedElement.selector}\nTag: <${selectedElement.tagName}>\n${selectedElement.react ? `React component: ${selectedElement.react.name}\n` : ""}${selectedElement.text ? `Text: "${selectedElement.text.slice(0, 80)}${selectedElement.text.length > 80 ? "…" : ""}"\n\n` : ""}User message: ${prompt}`
+      : prompt;
+    sendPrompt(content, selectedModel);
     setPrompt("");
+    setSelectedElement(null);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -232,6 +272,7 @@ export default function SessionPage() {
   return (
     <SidebarLayout>
       <SessionContent
+        sessionId={sessionId}
         sessionState={sessionState}
         connected={connected}
         connecting={connecting}
@@ -249,6 +290,10 @@ export default function SessionPage() {
         modelDropdownOpen={modelDropdownOpen}
         modelDropdownRef={modelDropdownRef}
         inputRef={inputRef}
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        latestStreamFrame={latestStreamFrame}
+        isStreaming={isStreaming}
         handleSubmit={handleSubmit}
         handleInputChange={handleInputChange}
         handleKeyDown={handleKeyDown}
@@ -257,12 +302,15 @@ export default function SessionPage() {
         stopExecution={stopExecution}
         handleArchive={handleArchive}
         handleUnarchive={handleUnarchive}
+        selectedElement={selectedElement}
+        setSelectedElement={setSelectedElement}
       />
     </SidebarLayout>
   );
 }
 
 function SessionContent({
+  sessionId,
   sessionState,
   connected,
   connecting,
@@ -280,6 +328,10 @@ function SessionContent({
   modelDropdownOpen,
   modelDropdownRef,
   inputRef,
+  activeTab,
+  setActiveTab,
+  latestStreamFrame,
+  isStreaming,
   handleSubmit,
   handleInputChange,
   handleKeyDown,
@@ -288,7 +340,10 @@ function SessionContent({
   stopExecution,
   handleArchive,
   handleUnarchive,
+  selectedElement,
+  setSelectedElement,
 }: {
+  sessionId: string;
   sessionState: ReturnType<typeof useSessionSocket>["sessionState"];
   connected: boolean;
   connecting: boolean;
@@ -306,6 +361,10 @@ function SessionContent({
   modelDropdownOpen: boolean;
   modelDropdownRef: React.RefObject<HTMLDivElement | null>;
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
+  activeTab: MainTab;
+  setActiveTab: (tab: MainTab) => void;
+  latestStreamFrame: StreamFrame | null;
+  isStreaming: boolean;
   handleSubmit: (e: React.FormEvent) => void;
   handleInputChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
   handleKeyDown: (e: React.KeyboardEvent) => void;
@@ -314,6 +373,8 @@ function SessionContent({
   stopExecution: () => void;
   handleArchive: () => void;
   handleUnarchive: () => void;
+  selectedElement: SelectedElementInfo | null;
+  setSelectedElement: (el: SelectedElementInfo | null) => void;
 }) {
   const { isOpen, toggle } = useSidebarContext();
 
@@ -393,27 +454,91 @@ function SessionContent({
         </div>
       )}
 
+      {/* Tab bar */}
+      <div className="flex items-center border-b border-border-muted bg-muted/30">
+        <TabButton
+          active={activeTab === "chat"}
+          onClick={() => setActiveTab("chat")}
+          icon={<ChatIcon className="w-4 h-4" />}
+        >
+          Chat
+        </TabButton>
+        <TabButton
+          active={activeTab === "preview"}
+          onClick={() => setActiveTab("preview")}
+          icon={<GlobeIcon className="w-4 h-4" />}
+          badge={artifacts.some((a) => a.type === "preview") ? "live" : undefined}
+        >
+          Preview
+        </TabButton>
+        <TabButton
+          active={activeTab === "code"}
+          onClick={() => setActiveTab("code")}
+          icon={<CodeIcon className="w-4 h-4" />}
+          badge={
+            artifacts.some(
+              (a) =>
+                a.type === "preview" && (a.metadata?.tunnelUrls as Record<string, string>)?.["8080"]
+            )
+              ? "ready"
+              : undefined
+          }
+        >
+          Code
+        </TabButton>
+        <TabButton
+          active={activeTab === "agent-view"}
+          onClick={() => setActiveTab("agent-view")}
+          icon={<MonitorIcon className="w-4 h-4" />}
+          badge={isStreaming ? "live" : undefined}
+        >
+          Agent View
+        </TabButton>
+      </div>
+
       {/* Main content */}
       <main className="flex-1 flex overflow-hidden">
-        {/* Event timeline */}
-        <div className="flex-1 overflow-y-auto p-4">
-          <div className="max-w-3xl mx-auto space-y-2">
-            {groupedEvents.map((group) =>
-              group.type === "tool_group" ? (
-                <ToolCallGroup key={group.id} events={group.events} groupId={group.id} />
-              ) : (
-                <EventItem
-                  key={group.id}
-                  event={group.event}
-                  currentParticipantId={currentParticipantId}
-                />
-              )
-            )}
-            {isProcessing && <ThinkingIndicator />}
+        {/* Tab content */}
+        {activeTab === "chat" ? (
+          <div className="flex-1 overflow-y-auto p-4">
+            <div className="max-w-3xl mx-auto space-y-2">
+              {groupedEvents.map((group) =>
+                group.type === "tool_group" ? (
+                  <ToolCallGroup key={group.id} events={group.events} groupId={group.id} />
+                ) : (
+                  <EventItem
+                    key={group.id}
+                    event={group.event}
+                    currentParticipantId={currentParticipantId}
+                  />
+                )
+              )}
+              {isProcessing && <ThinkingIndicator />}
 
-            <div ref={messagesEndRef} />
+              <div ref={messagesEndRef} />
+            </div>
           </div>
-        </div>
+        ) : activeTab === "preview" ? (
+          <div className="flex-1">
+            <PreviewPanel
+              artifacts={artifacts}
+              sessionId={sessionId}
+              onSelectElement={setSelectedElement}
+            />
+          </div>
+        ) : activeTab === "code" ? (
+          <div className="flex-1">
+            <VSCodePanel artifacts={artifacts} sessionId={sessionId} />
+          </div>
+        ) : (
+          <div className="flex-1">
+            <AgentViewPanel
+              sessionId={sessionId}
+              latestFrame={latestStreamFrame}
+              isStreaming={isStreaming}
+            />
+          </div>
+        )}
 
         {/* Right sidebar */}
         <SessionRightSidebar
@@ -437,6 +562,25 @@ function SessionContent({
               onUnarchive={handleUnarchive}
             />
           </div>
+
+          {/* Selected element context (from Preview → Select) */}
+          {selectedElement && (
+            <div className="mb-3 flex items-center gap-2 px-3 py-2 rounded-lg bg-muted/50 border border-border text-sm">
+              <span className="text-muted-foreground">Selected:</span>
+              <code className="flex-1 truncate text-foreground" title={selectedElement.selector}>
+                &lt;{selectedElement.tagName}&gt;
+                {selectedElement.react ? ` (${selectedElement.react.name})` : ""}
+              </code>
+              <button
+                type="button"
+                onClick={() => setSelectedElement(null)}
+                className="text-muted-foreground hover:text-foreground px-2 py-0.5 rounded"
+                title="Clear selection"
+              >
+                Clear
+              </button>
+            </div>
+          )}
 
           {/* Input container */}
           <div className="border border-border bg-input">
@@ -554,6 +698,92 @@ function SidebarToggleIcon() {
     >
       <rect x="3" y="3" width="18" height="18" rx="2" />
       <line x1="9" y1="3" x2="9" y2="21" />
+    </svg>
+  );
+}
+
+function TabButton({
+  active,
+  onClick,
+  icon,
+  badge,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  icon: React.ReactNode;
+  badge?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium transition-colors relative ${
+        active
+          ? "text-foreground border-b-2 border-accent -mb-px"
+          : "text-muted-foreground hover:text-foreground"
+      }`}
+    >
+      {icon}
+      {children}
+      {badge && (
+        <span className="px-1.5 py-0.5 text-[10px] font-medium bg-success/20 text-success rounded uppercase">
+          {badge}
+        </span>
+      )}
+    </button>
+  );
+}
+
+function ChatIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth={2}
+        d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
+      />
+    </svg>
+  );
+}
+
+function GlobeIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth={2}
+        d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"
+      />
+    </svg>
+  );
+}
+
+function CodeIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth={2}
+        d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"
+      />
+    </svg>
+  );
+}
+
+function MonitorIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth={2}
+        d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"
+      />
     </svg>
   );
 }

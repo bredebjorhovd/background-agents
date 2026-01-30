@@ -8,7 +8,7 @@
 import { tool } from "@opencode-ai/plugin"
 import { z } from "zod"
 import { execFileSync } from "node:child_process"
-import { readFileSync, mkdtSync, rmSync } from "node:fs"
+import { readFileSync, mkdtempSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 
@@ -50,7 +50,7 @@ export default tool({
     }
 
     const url = args.url || "http://localhost:5173"
-    const dir = mkdtSync(join(tmpdir(), "screenshot-"))
+    const dir = mkdtempSync(join(tmpdir(), "screenshot-"))
     const outputPath = join(dir, "screenshot.png")
 
     try {

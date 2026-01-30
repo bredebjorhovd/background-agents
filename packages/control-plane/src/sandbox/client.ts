@@ -38,7 +38,8 @@ export interface CreateSandboxResponse {
   modalObjectId?: string; // Modal's internal object ID for snapshot API
   status: string;
   createdAt: number;
-  previewTunnelUrl?: string; // Public URL for live preview (port 5173)
+  previewTunnelUrl?: string; // Public URL for live preview (port 5173, primary)
+  tunnelUrls?: Record<number, string>; // All tunnel URLs by port
 }
 
 export interface WarmSandboxRequest {
@@ -171,6 +172,7 @@ export class ModalClient {
       status: string;
       created_at: number;
       preview_tunnel_url?: string;
+      tunnel_urls?: Record<number, string>;
     }>;
 
     if (!result.success || !result.data) {
@@ -183,6 +185,7 @@ export class ModalClient {
       status: result.data.status,
       createdAt: result.data.created_at,
       previewTunnelUrl: result.data.preview_tunnel_url,
+      tunnelUrls: result.data.tunnel_urls,
     };
   }
 

@@ -456,6 +456,29 @@ deploy steps (Terraform apply, worker deploy, Modal deploy, Vercel deploy).
 So a single `terraform apply` plus your normal deploys is low-risk; having a tag and a plan to
 revert (Terraform + app) is enough for a non-destructive test.
 
+## Troubleshooting
+
+### "Provider produced inconsistent final plan" on `cloudflare_worker_version`
+
+If `terraform apply` fails with:
+
+```text
+Error: Provider produced inconsistent final plan
+When expanding the plan for module.control_plane_worker.cloudflare_worker_version.this ...
+planned set element ... does not correlate with any element in actual.
+```
+
+this is a known Cloudflare provider bug when comparing the worker version’s `modules` set.
+Workaround: taint the worker version so the next apply recreates it, then apply again:
+
+```bash
+cd terraform/environments/production
+terraform taint 'module.control_plane_worker.cloudflare_worker_version.this'
+terraform apply
+```
+
+The worker will be redeployed with the same script; only the version resource is recreated.
+
 ## Adding New Environments
 
 To add a staging environment:

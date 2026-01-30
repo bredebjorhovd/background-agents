@@ -167,4 +167,8 @@ export function initSchema(sql: SqlStorage): void {
 
   // Migration: Add preview_tunnel_url column to sandbox table for live preview
   runMigration(sql, `ALTER TABLE sandbox ADD COLUMN preview_tunnel_url TEXT`);
+
+  // Migration: Add tunnel_urls column to sandbox table for multiple port support
+  // Stores JSON object mapping port numbers to tunnel URLs
+  runMigration(sql, `ALTER TABLE sandbox ADD COLUMN tunnel_urls TEXT`);
 }

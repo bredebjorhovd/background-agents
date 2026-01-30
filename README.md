@@ -9,7 +9,7 @@ Open-Inspect provides a hosted coding agent that can:
 
 - Work on tasks in the background while you focus on other things
 - Access full development environments with all tools engineers have
-- Support multiple clients (web, Slack, Chrome extension)
+- Support multiple clients (web, Slack)
 - Enable multiplayer sessions where multiple people can collaborate
 - Create PRs with proper commit attribution
 

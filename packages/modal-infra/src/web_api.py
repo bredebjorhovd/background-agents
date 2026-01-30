@@ -107,7 +107,7 @@ async def api_create_sandbox(
         # Import types and manager directly
         from .auth.github_app import generate_installation_token
         from .sandbox.manager import SandboxConfig, SandboxManager
-        from .sandbox.types import GitUser, SessionConfig
+        from .sandbox.sandbox_types import GitUser, SessionConfig
 
         manager = SandboxManager()
 
@@ -166,6 +166,7 @@ async def api_create_sandbox(
                 "status": handle.status.value,
                 "created_at": handle.created_at,
                 "preview_tunnel_url": handle.preview_tunnel_url,
+                "tunnel_urls": handle.tunnel_urls,  # All tunnel URLs by port
             },
         }
     except Exception as e:

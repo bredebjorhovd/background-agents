@@ -8,7 +8,7 @@ The control plane provides:
 
 - **Session Management**: SQLite-backed Durable Objects for each session
 - **Real-time Streaming**: WebSocket connections with hibernation support
-- **Multi-client Sync**: Web, Slack, extension clients all see the same state
+- **Multi-client Sync**: Web and Slack clients see the same state
 - **GitHub Integration**: GitHub App for repository access
 - **Token Encryption**: AES-256-GCM encryption for GitHub tokens at rest
 

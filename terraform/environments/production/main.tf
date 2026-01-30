@@ -17,9 +17,9 @@ locals {
   web_app_url        = "https://open-inspect-${local.name_suffix}.vercel.app"
   ws_url             = "wss://${local.control_plane_host}"
 
-  # Worker script paths (deterministic output locations)
-  control_plane_script_path = "${var.project_root}/packages/control-plane/dist/index.js"
-  slack_bot_script_path     = "${var.project_root}/packages/slack-bot/dist/index.js"
+  # Worker script paths (deterministic; no double slash from project_root)
+  control_plane_script_path = "${trimsuffix(var.project_root, "/")}/packages/control-plane/dist/index.js"
+  slack_bot_script_path     = "${trimsuffix(var.project_root, "/")}/packages/slack-bot/dist/index.js"
 }
 
 # =============================================================================
