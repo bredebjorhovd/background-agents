@@ -5,7 +5,7 @@ and from inside sandboxes (which don't have modal). We use lazy imports to avoid
 ModuleNotFoundError when running inside a sandbox.
 """
 
-from .types import GitSyncStatus, GitUser, SandboxEvent, SandboxStatus, SessionConfig
+from .sandbox_types import GitSyncStatus, GitUser, SandboxEvent, SandboxStatus, SessionConfig
 
 
 # Manager is only available when running in Modal function context (not inside sandbox)

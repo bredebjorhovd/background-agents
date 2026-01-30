@@ -18,7 +18,7 @@ import modal
 
 from ..app import app, llm_secrets
 from ..images.base import base_image
-from .types import SandboxStatus, SessionConfig
+from .sandbox_types import SandboxStatus, SessionConfig
 
 
 @dataclass
@@ -36,6 +36,16 @@ class SandboxConfig:
     github_app_token: str | None = None  # GitHub App token for git operations
 
 
+# Ports for live preview - cover common frameworks
+# Port 5173: Vite, Svelte, Astro
+# Port 3000: Next.js, CRA, Express, generic Node servers
+# Port 8080: code-server (VS Code), Angular, generic servers
+PREVIEW_PORTS = [5173, 3000, 8080]
+
+# Primary preview port (for backwards compatibility)
+PREVIEW_PORT = 5173
+
+
 @dataclass
 class SandboxHandle:
     """Handle to a running or warm sandbox."""
@@ -46,6 +56,8 @@ class SandboxHandle:
     created_at: float
     snapshot_id: str | None = None
     modal_object_id: str | None = None  # Modal's internal sandbox ID for API calls
+    preview_tunnel_url: str | None = None  # Public URL for port 5173 (live preview)
+    tunnel_urls: dict[int, str] | None = None  # All tunnel URLs by port
 
     def get_logs(self) -> str:
         """Get sandbox logs."""
@@ -121,8 +133,7 @@ class SandboxManager:
             # Use base image (would be repo-specific in production)
             image = base_image
 
-        # Create the sandbox
-        # The entrypoint command is passed as positional args
+        # Create the sandbox with preview ports forwarded for all common frameworks
         sandbox = modal.Sandbox.create(
             "python",
             "-m",
@@ -133,6 +144,7 @@ class SandboxManager:
             timeout=int(config.timeout_hours * 3600),
             workdir="/workspace",
             env=env_vars,
+            encrypted_ports=PREVIEW_PORTS,
             # Note: volumes parameter is not supported in Sandbox.create
         )
 
@@ -142,6 +154,25 @@ class SandboxManager:
             f"[manager] Created sandbox: sandbox_id={sandbox_id}, modal_object_id={modal_object_id}"
         )
 
+        # Get tunnel URLs for all exposed ports
+        preview_tunnel_url = None
+        tunnel_urls: dict[int, str] = {}
+        try:
+            tunnels = sandbox.tunnels()
+            for port in PREVIEW_PORTS:
+                if port in tunnels:
+                    tunnel_urls[port] = tunnels[port].url
+                    print(f"[manager] Tunnel URL for port {port}: {tunnels[port].url}")
+            # Primary preview URL (backwards compatibility)
+            if PREVIEW_PORT in tunnel_urls:
+                preview_tunnel_url = tunnel_urls[PREVIEW_PORT]
+            elif tunnel_urls:
+                # Fallback to first available
+                preview_tunnel_url = next(iter(tunnel_urls.values()))
+            print(f"[manager] Available tunnel ports: {list(tunnel_urls.keys())}")
+        except Exception as e:
+            print(f"[manager] Failed to get tunnel URLs: {e}")
+
         return SandboxHandle(
             sandbox_id=sandbox_id,
             modal_sandbox=sandbox,
@@ -149,6 +180,8 @@ class SandboxManager:
             created_at=time.time(),
             snapshot_id=config.snapshot_id,
             modal_object_id=modal_object_id,
+            preview_tunnel_url=preview_tunnel_url,
+            tunnel_urls=tunnel_urls if tunnel_urls else None,
         )
 
     async def warm_sandbox(
@@ -313,7 +346,7 @@ class SandboxManager:
             ),
         }
 
-        # Create the sandbox from the snapshot image
+        # Create the sandbox from the snapshot image with encrypted ports for previews
         sandbox = modal.Sandbox.create(
             "python",
             "-m",
@@ -324,9 +357,26 @@ class SandboxManager:
             timeout=2 * 3600,  # 2 hours
             workdir="/workspace",
             env=env_vars,
+            encrypted_ports=PREVIEW_PORTS,
         )
 
         print(f"[manager] Sandbox restored from snapshot: {sandbox_id} (image={snapshot_image_id})")
+
+        # Get tunnel URLs for restored sandbox
+        preview_tunnel_url = None
+        tunnel_urls: dict[int, str] = {}
+        try:
+            tunnels = sandbox.tunnels()
+            for port in PREVIEW_PORTS:
+                if port in tunnels:
+                    tunnel_urls[port] = tunnels[port].url
+            if PREVIEW_PORT in tunnel_urls:
+                preview_tunnel_url = tunnel_urls[PREVIEW_PORT]
+            elif tunnel_urls:
+                preview_tunnel_url = next(iter(tunnel_urls.values()))
+            print(f"[manager] Restored sandbox tunnel ports: {list(tunnel_urls.keys())}")
+        except Exception as e:
+            print(f"[manager] Failed to get tunnel URLs for restored sandbox: {e}")
 
         return SandboxHandle(
             sandbox_id=sandbox_id,
@@ -334,6 +384,8 @@ class SandboxManager:
             status=SandboxStatus.WARMING,
             created_at=time.time(),
             snapshot_id=snapshot_image_id,
+            preview_tunnel_url=preview_tunnel_url,
+            tunnel_urls=tunnel_urls if tunnel_urls else None,
         )
 
     async def maintain_warm_pool(

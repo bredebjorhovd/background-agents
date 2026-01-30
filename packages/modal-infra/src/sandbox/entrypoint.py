@@ -229,6 +229,26 @@ class SandboxSupervisor:
             tool_dest.mkdir(parents=True, exist_ok=True)
             shutil.copy(tool_source, tool_dest / "create-pull-request.js")
             print("[supervisor] Copied create-pull-request tool")
+            take_screenshot_js = Path("/app/sandbox/take-screenshot.js")
+            if take_screenshot_js.exists():
+                shutil.copy(take_screenshot_js, tool_dest / "take-screenshot.js")
+                print("[supervisor] Copied take-screenshot tool")
+            start_preview_js = Path("/app/sandbox/start-preview.js")
+            if start_preview_js.exists():
+                shutil.copy(start_preview_js, tool_dest / "start-preview.js")
+                print("[supervisor] Copied start-preview tool")
+            start_vscode_js = Path("/app/sandbox/start-vscode.js")
+            if start_vscode_js.exists():
+                shutil.copy(start_vscode_js, tool_dest / "start-vscode.js")
+                print("[supervisor] Copied start-vscode tool")
+            start_stream_js = Path("/app/sandbox/start-stream.js")
+            if start_stream_js.exists():
+                shutil.copy(start_stream_js, tool_dest / "start-stream.js")
+                print("[supervisor] Copied start-stream tool")
+            capture_before_after_js = Path("/app/sandbox/capture-before-after.js")
+            if capture_before_after_js.exists():
+                shutil.copy(capture_before_after_js, tool_dest / "capture-before-after.js")
+                print("[supervisor] Copied capture-before-after tool")
 
             # Create node_modules symlink to global modules so OpenCode doesn't try to install
             # and so imports resolve correctly via NODE_PATH

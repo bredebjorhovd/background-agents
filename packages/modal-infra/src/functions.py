@@ -63,7 +63,7 @@ async def create_sandbox(
     # Lazy imports to avoid pydantic at module load time
     from .auth.github_app import generate_installation_token
     from .sandbox.manager import SandboxConfig
-    from .sandbox.types import GitUser, SessionConfig
+    from .sandbox.sandbox_types import GitUser, SessionConfig
 
     manager = get_manager()
 

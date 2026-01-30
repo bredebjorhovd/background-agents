@@ -25,7 +25,7 @@ import httpx
 import websockets
 from websockets import ClientConnection, State
 
-from .types import GitUser
+from .sandbox_types import GitUser
 
 
 class TokenResolution(NamedTuple):
@@ -320,6 +320,8 @@ class AgentBridge:
             self.git_sync_complete.set()
         elif cmd_type == "push":
             await self._handle_push(cmd)
+        elif cmd_type == "getElementAtPoint":
+            await self._handle_get_element_at_point(cmd)
         else:
             print(f"[bridge] Unknown command type: {cmd_type}")
         return None
@@ -543,6 +545,8 @@ class AgentBridge:
         cumulative_text: dict[str, str] = {}
         emitted_tool_states: set[str] = set()
         our_assistant_msg_ids: set[str] = set()
+        # Parts that arrived before we saw message.updated; flush when we see assistant msg
+        buffered_parts_by_msg_id: dict[str, list[dict[str, Any]]] = {}
 
         max_wait_time = 300.0
         start_time = time.time()
@@ -618,9 +622,56 @@ class AgentBridge:
                                         f"[bridge] Tracking assistant message {oc_msg_id} "
                                         f"(parentID matched)"
                                     )
+                                    # Flush parts that arrived before this message.updated
+                                    for part in buffered_parts_by_msg_id.pop(oc_msg_id, []):
+                                        part_type = part.get("type", "")
+                                        part_id = part.get("id", "")
+                                        delta = part.get("delta")
+                                        if part_type == "text":
+                                            text = part.get("text", "")
+                                            if delta:
+                                                cumulative_text[part_id] = (
+                                                    cumulative_text.get(part_id, "") + delta
+                                                )
+                                            else:
+                                                cumulative_text[part_id] = text
+                                            if cumulative_text.get(part_id):
+                                                yield {
+                                                    "type": "token",
+                                                    "content": cumulative_text[part_id],
+                                                    "messageId": message_id,
+                                                }
+                                        elif part_type == "tool":
+                                            tool_event = self._transform_part_to_event(
+                                                part, message_id
+                                            )
+                                            if tool_event:
+                                                state = part.get("state", {})
+                                                status = state.get("status", "")
+                                                call_id = part.get("callID", "")
+                                                tool_key = f"tool:{call_id}:{status}"
+                                                if tool_key not in emitted_tool_states:
+                                                    emitted_tool_states.add(tool_key)
+                                                    yield tool_event
+                                        elif part_type == "step-start":
+                                            yield {
+                                                "type": "step_start",
+                                                "messageId": message_id,
+                                            }
+                                        elif part_type == "step-finish":
+                                            yield {
+                                                "type": "step_finish",
+                                                "cost": part.get("cost"),
+                                                "tokens": part.get("tokens"),
+                                                "reason": part.get("reason"),
+                                                "messageId": message_id,
+                                            }
 
                                 if finish and finish not in ("tool-calls", ""):
                                     print(f"[bridge] SSE message finished (finish={finish})")
+                                # Discard buffered parts for user messages (never emit them)
+                                if role == "user" and oc_msg_id:
+                                    buffered_parts_by_msg_id.pop(oc_msg_id, None)
                             continue
 
                         if event_type == "message.part.updated":
@@ -630,7 +681,9 @@ class AgentBridge:
                             part_id = part.get("id", "")
                             oc_msg_id = part.get("messageID", "")
 
-                            if our_assistant_msg_ids and oc_msg_id not in our_assistant_msg_ids:
+                            # Only emit parts from assistant messages; buffer until we know role
+                            if oc_msg_id not in our_assistant_msg_ids:
+                                buffered_parts_by_msg_id.setdefault(oc_msg_id, []).append(part)
                                 continue
 
                             if part_type == "text":
@@ -971,6 +1024,93 @@ class AgentBridge:
                     "error": str(e),
                     "branchName": branch_name,
                 }
+            )
+
+    async def _handle_get_element_at_point(self, cmd: dict[str, Any]) -> None:
+        """Get DOM element at (x, y) in the preview page and send result to control plane."""
+        request_id = cmd.get("requestId")
+        x = cmd.get("x")
+        y = cmd.get("y")
+        if request_id is None or x is None or y is None:
+            await self._send_event(
+                {
+                    "type": "getElementAtPointError",
+                    "requestId": request_id,
+                    "error": "Missing requestId, x, or y",
+                }
+            )
+            return
+
+        viewport_width = cmd.get("viewportWidth")
+        viewport_height = cmd.get("viewportHeight")
+        script_path = Path("/app/sandbox/get_element_at_point.py")
+        if not script_path.exists():
+            await self._send_event(
+                {
+                    "type": "getElementAtPointError",
+                    "requestId": request_id,
+                    "error": "get_element_at_point.py not found",
+                }
+            )
+            return
+
+        script_args: list[str] = [
+            "python3",
+            str(script_path),
+            "http://localhost:5173",
+            str(int(x)),
+            str(int(y)),
+        ]
+        if viewport_width is not None and viewport_height is not None:
+            script_args.extend([str(int(viewport_width)), str(int(viewport_height))])
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *script_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+            out = stdout.decode().strip() or stderr.decode().strip()
+            if not out:
+                await self._send_event(
+                    {
+                        "type": "getElementAtPointError",
+                        "requestId": request_id,
+                        "error": "No output from script",
+                    }
+                )
+                return
+            data = json.loads(out)
+            if "error" in data:
+                await self._send_event(
+                    {
+                        "type": "getElementAtPointError",
+                        "requestId": request_id,
+                        "error": data["error"],
+                    }
+                )
+                return
+            element = data.get("element")
+            await self._send_event(
+                {"type": "getElementAtPointResponse", "requestId": request_id, "element": element}
+            )
+        except TimeoutError:
+            await self._send_event(
+                {
+                    "type": "getElementAtPointError",
+                    "requestId": request_id,
+                    "error": "Element lookup timed out",
+                }
+            )
+        except (json.JSONDecodeError, ValueError) as e:
+            await self._send_event(
+                {"type": "getElementAtPointError", "requestId": request_id, "error": str(e)}
+            )
+        except Exception as e:
+            print(f"[bridge] getElementAtPoint error: {e}")
+            await self._send_event(
+                {"type": "getElementAtPointError", "requestId": request_id, "error": str(e)}
             )
 
     async def _configure_git_identity(self, user: GitUser) -> None:

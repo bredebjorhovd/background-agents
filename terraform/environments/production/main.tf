@@ -17,9 +17,9 @@ locals {
   web_app_url        = "https://open-inspect-${local.name_suffix}.vercel.app"
   ws_url             = "wss://${local.control_plane_host}"
 
-  # Worker script paths (deterministic output locations)
-  control_plane_script_path = "${var.project_root}/packages/control-plane/dist/index.js"
-  slack_bot_script_path     = "${var.project_root}/packages/slack-bot/dist/index.js"
+  # Worker script paths (deterministic; no double slash from project_root)
+  control_plane_script_path = "${trimsuffix(var.project_root, "/")}/packages/control-plane/dist/index.js"
+  slack_bot_script_path     = "${trimsuffix(var.project_root, "/")}/packages/slack-bot/dist/index.js"
 }
 
 # =============================================================================
@@ -38,6 +38,18 @@ module "slack_kv" {
 
   account_id     = var.cloudflare_account_id
   namespace_name = "open-inspect-slack-kv-${local.name_suffix}"
+}
+
+# =============================================================================
+# Cloudflare R2 (artifacts / screenshots)
+# =============================================================================
+
+module "artifacts_r2" {
+  source = "../../modules/cloudflare-r2"
+
+  account_id  = var.cloudflare_account_id
+  bucket_name = "open-inspect-artifacts-${local.name_suffix}"
+  location    = "ENAM"
 }
 
 # =============================================================================
@@ -69,6 +81,13 @@ module "control_plane_worker" {
     {
       binding_name = "SESSION_INDEX"
       namespace_id = module.session_index_kv.namespace_id
+    }
+  ]
+
+  r2_buckets = [
+    {
+      binding_name = "R2_ARTIFACTS"
+      bucket_name  = module.artifacts_r2.bucket_name
     }
   ]
 
@@ -112,7 +131,7 @@ module "control_plane_worker" {
   compatibility_flags = ["nodejs_compat"]
   migration_tag       = "v1"
 
-  depends_on = [null_resource.control_plane_build, module.session_index_kv]
+  depends_on = [null_resource.control_plane_build, module.session_index_kv, module.artifacts_r2]
 }
 
 # Build slack-bot worker bundle (only runs during apply, not plan)

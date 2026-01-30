@@ -23,8 +23,11 @@ SANDBOX_DIR = Path(__file__).parent.parent / "sandbox"
 OPENCODE_VERSION = "latest"
 
 # Cache buster - change this to force Modal image rebuild
-# v32: Structured error responses for create-pull-request tool
-CACHE_BUSTER = "v32-structured-pr-errors"
+# v37: code-server default config (auth: none) in image
+CACHE_BUSTER = "v37-code-server-no-auth"
+
+# code-server version to install
+CODE_SERVER_VERSION = "4.96.2"
 
 # Base image with all development tools
 base_image = (
@@ -97,12 +100,22 @@ base_image = (
         "playwright install chromium",
         "playwright install-deps chromium",
     )
+    # Install code-server for VS Code in browser
+    .run_commands(
+        # Download and install code-server
+        f"curl -fsSL https://code-server.dev/install.sh | sh -s -- --version={CODE_SERVER_VERSION}",
+        # Verify installation
+        "code-server --version || echo 'code-server installed'",
+        # Create code-server config directory and default config (no password; Modal tunnel is the auth)
+        "mkdir -p /root/.config/code-server",
+        "printf 'bind-addr: 0.0.0.0:8080\\nauth: none\\ncert: false\\n' > /root/.config/code-server/config.yaml",
+    )
     # Create working directories
     .run_commands(
         "mkdir -p /workspace",
         "mkdir -p /app/plugins",
         "mkdir -p /tmp/opencode",
-        "echo 'Image rebuilt at: v21-force-rebuild' > /app/image-version.txt",
+        f"echo 'Image rebuilt at: {CACHE_BUSTER}' > /app/image-version.txt",
     )
     # Set environment variables (including cache buster to force rebuild)
     .env(

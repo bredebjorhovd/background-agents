@@ -381,6 +381,104 @@ variables.
 2. Check script exists: `ls packages/control-plane/dist/index.js`
 3. Verify API token permissions
 
+## Testing changes safely and rolling back
+
+### 1. Plan first (no changes)
+
+Always run a plan before apply. Nothing is modified.
+
+```bash
+cd terraform/environments/production
+terraform plan
+```
+
+Review the plan: new resources (e.g. R2 bucket, worker version with new binding) and any in-place
+updates. If anything looks wrong, do not apply.
+
+### 2. Optional: use a staging environment
+
+To test screenshots/preview (or any change) without touching production:
+
+1. Copy the production environment and use a different `deployment_name`:
+
+   ```bash
+   cp -r environments/production environments/staging
+   ```
+
+2. In `staging/backend.tf`, set a different state key, e.g. `key = "staging/terraform.tfstate"`.
+3. In `staging/terraform.tfvars`, set `deployment_name = "staging"` (and any staging-specific vars).
+4. Run `terraform init -backend-config=...` and `terraform apply` in `staging/`.
+
+You get separate resources (`open-inspect-control-plane-staging`, `open-inspect-artifacts-staging`,
+etc.). Test there; if it works, apply the same code to production. If not, fix and re-apply to
+staging, or destroy staging: `terraform destroy` in `staging/`.
+
+### 3. Tag before apply (easy rollback point)
+
+Before applying to production, create a tag so you can revert code and redeploy to this state:
+
+```bash
+git tag pre-screenshots-preview   # or any name
+# then terraform apply, deploy control plane / Modal / web
+```
+
+To roll back later: `git checkout pre-screenshots-preview` (or revert the commits), then re-run your
+deploy steps (Terraform apply, worker deploy, Modal deploy, Vercel deploy).
+
+### 4. What happens if you roll back
+
+- **Roll back only Terraform** (remove the new R2 module and worker R2 binding, then
+  `terraform apply`):  
+  The new control plane code stays deployed, but the Worker no longer has an R2 binding. Screenshot
+  upload returns 503 “R2 not configured”. Rest of the app (sessions, PRs, etc.) keeps working.
+  Preview tunnel URL may still be set if Modal returns it; “View preview” can work if the artifact
+  was already created.
+
+- **Roll back everything** (revert Terraform + control plane + Modal + web code, then
+  `terraform apply` and redeploy):  
+  You return to the previous behaviour. R2 bucket can be removed by Terraform if you reverted the R2
+  module (Terraform will drop the bucket and the binding). **Note:** Destroying the R2 bucket
+  deletes all objects in it (e.g. any screenshots already stored).
+
+- **Roll back only app code** (revert control plane / Modal / web, keep Terraform as-is):  
+  Worker and Modal run the old code; the new R2 bucket and binding stay but are unused until you
+  deploy the new code again.
+
+### 5. Risk level of this change
+
+- **Terraform:** Additive only (new R2 bucket, new binding on existing worker). No renames or
+  removals of existing resources.
+- **Control plane:** New routes and optional R2 usage; if `R2_ARTIFACTS` is missing, screenshot
+  upload returns 503 and the rest of the API is unchanged.
+- **Modal:** `encrypted_ports=[5173]` added to sandbox create; if tunnel URL fails we store `null`
+  and continue, so sandbox creation does not fail.
+
+So a single `terraform apply` plus your normal deploys is low-risk; having a tag and a plan to
+revert (Terraform + app) is enough for a non-destructive test.
+
+## Troubleshooting
+
+### "Provider produced inconsistent final plan" on `cloudflare_worker_version`
+
+If `terraform apply` fails with:
+
+```text
+Error: Provider produced inconsistent final plan
+When expanding the plan for module.control_plane_worker.cloudflare_worker_version.this ...
+planned set element ... does not correlate with any element in actual.
+```
+
+this is a known Cloudflare provider bug when comparing the worker version’s `modules` set.
+Workaround: taint the worker version so the next apply recreates it, then apply again:
+
+```bash
+cd terraform/environments/production
+terraform taint 'module.control_plane_worker.cloudflare_worker_version.this'
+terraform apply
+```
+
+The worker will be redeployed with the same script; only the version resource is recreated.
+
 ## Adding New Environments
 
 To add a staging environment:
