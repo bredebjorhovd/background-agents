@@ -20,6 +20,73 @@ export const SUMMARY_TOOL_NAMES = ["Edit", "Write", "Bash", "Grep", "Read"] as c
 // Server-side limit for events API
 const EVENTS_PAGE_LIMIT = 200;
 
+/** Control plane artifacts API response shape. */
+interface ArtifactsApiResponse {
+  artifacts: Array<{
+    id: string;
+    type: string;
+    url: string | null;
+    metadata?: Record<string, unknown> | null;
+    createdAt?: number;
+  }>;
+}
+
+/**
+ * Map artifact type and metadata to display label.
+ */
+function artifactToInfo(
+  type: string,
+  url: string,
+  metadata?: Record<string, unknown> | null
+): ArtifactInfo {
+  let label: string;
+  if (type === "pr") {
+    const prNum = metadata?.number;
+    label = prNum ? `PR #${prNum}` : "Pull Request";
+  } else if (type === "branch") {
+    label = `Branch: ${metadata?.name ?? "branch"}`;
+  } else if (type === "screenshot") {
+    label = "Screenshot";
+  } else if (type === "preview") {
+    label = "Live preview";
+  } else {
+    label = type;
+  }
+  return { type, url, label };
+}
+
+/**
+ * Fetch session artifacts from the control plane (screenshots, preview, PRs, branches).
+ * These are stored in the artifacts table; events API does not include them.
+ */
+async function fetchSessionArtifacts(env: Env, sessionId: string): Promise<ArtifactInfo[]> {
+  try {
+    const headers: Record<string, string> = { Accept: "application/json" };
+    if (env.INTERNAL_CALLBACK_SECRET) {
+      const authToken = await generateInternalToken(env.INTERNAL_CALLBACK_SECRET);
+      headers["Authorization"] = `Bearer ${authToken}`;
+    }
+
+    const url = `https://internal/sessions/${sessionId}/artifacts`;
+    const response = await env.CONTROL_PLANE.fetch(url, { headers });
+
+    if (!response.ok) {
+      console.error(`Failed to fetch artifacts: ${response.status}`);
+      return [];
+    }
+
+    const data = (await response.json()) as ArtifactsApiResponse;
+    const artifacts = data.artifacts ?? [];
+
+    return artifacts
+      .filter((a) => a.url)
+      .map((a) => artifactToInfo(a.type, a.url!, a.metadata ?? undefined));
+  } catch (error) {
+    console.error("Error fetching session artifacts:", error);
+    return [];
+  }
+}
+
 /**
  * Fetch events for a message and aggregate them into a response.
  *
@@ -82,14 +149,20 @@ export async function extractAgentResponse(
       .filter((e) => e.type === "tool_call")
       .map((e) => summarizeToolCall(e.data));
 
-    // Extract artifacts (PRs, branches)
-    const artifacts: ArtifactInfo[] = allEvents
-      .filter((e) => e.type === "artifact")
-      .map((e) => ({
-        type: String(e.data.artifactType ?? "unknown"),
-        url: String(e.data.url ?? ""),
-        label: getArtifactLabel(e.data),
-      }));
+    // Extract artifacts from events (fallback; screenshots/preview come from API)
+    const eventArtifacts: ArtifactInfo[] = allEvents
+      .filter((e) => e.type === "artifact" && e.data.url)
+      .map((e) =>
+        artifactToInfo(
+          String(e.data.artifactType ?? "unknown"),
+          String(e.data.url),
+          e.data.metadata as Record<string, unknown> | undefined
+        )
+      );
+
+    // Fetch artifacts from API (screenshots, preview, PRs, branches) - source of truth
+    const apiArtifacts = await fetchSessionArtifacts(env, sessionId);
+    const artifacts = apiArtifacts.length > 0 ? apiArtifacts : eventArtifacts;
 
     // Check for completion event to get success status
     const completionEvent = allEvents.find((e) => e.type === "execution_complete");
@@ -129,21 +202,4 @@ function summarizeToolCall(data: Record<string, unknown>): ToolCallSummary {
     default:
       return { tool, summary: `Used ${tool}` };
   }
-}
-
-/**
- * Get display label for an artifact.
- */
-function getArtifactLabel(data: Record<string, unknown>): string {
-  const type = String(data.artifactType ?? "artifact");
-  if (type === "pr") {
-    const metadata = data.metadata as Record<string, unknown> | undefined;
-    const prNum = metadata?.number;
-    return prNum ? `PR #${prNum}` : "Pull Request";
-  }
-  if (type === "branch") {
-    const metadata = data.metadata as Record<string, unknown> | undefined;
-    return `Branch: ${metadata?.name ?? "branch"}`;
-  }
-  return type;
 }
