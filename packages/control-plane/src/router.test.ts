@@ -69,7 +69,7 @@ describe("router authentication", () => {
       const response = await handleRequest(request, mockEnv);
 
       expect(response.status).toBe(200);
-      const data = await response.json();
+      const data = (await response.json()) as { error?: string; [key: string]: unknown };
       expect(data).toEqual({
         status: "healthy",
         service: "open-inspect-control-plane",
@@ -92,7 +92,7 @@ describe("router authentication", () => {
       const response = await handleRequest(request, mockEnv);
 
       expect(response.status).toBe(401);
-      const data = await response.json();
+      const data = (await response.json()) as { error?: string; [key: string]: unknown };
       expect(data.error).toBe("Unauthorized");
     });
 
@@ -120,7 +120,7 @@ describe("router authentication", () => {
       const response = await handleRequest(request, mockEnv);
 
       expect(response.status).toBe(401);
-      const data = await response.json();
+      const data = (await response.json()) as { error?: string; [key: string]: unknown };
       expect(data.error).toBe("Unauthorized");
     });
 
@@ -170,7 +170,7 @@ describe("router authentication", () => {
       const response = await handleRequest(request, envWithoutSecret);
 
       expect(response.status).toBe(500);
-      const data = await response.json();
+      const data = (await response.json()) as { error?: string; [key: string]: unknown };
       expect(data.error).toBe("Internal authentication not configured");
     });
 
@@ -255,7 +255,7 @@ describe("router authentication", () => {
       const response = await handleRequest(request, mockEnv);
 
       expect(response.status).toBe(401);
-      const data = await response.json();
+      const data = (await response.json()) as { error?: string; [key: string]: unknown };
       expect(data.error).toContain("Invalid sandbox token");
     });
 
@@ -282,7 +282,7 @@ describe("router authentication", () => {
       const response = await handleRequest(request, mockEnv);
 
       expect(response.status).toBe(401);
-      const data = await response.json();
+      const data = (await response.json()) as { error?: string; [key: string]: unknown };
       expect(data.error).toContain("Missing sandbox token");
     });
 
@@ -333,7 +333,7 @@ describe("router authentication", () => {
       const response = await handleRequest(request, mockEnv);
 
       expect(response.status).toBe(404);
-      const data = await response.json();
+      const data = (await response.json()) as { error?: string; [key: string]: unknown };
       expect(data.error).toBe("Not found");
     });
 
