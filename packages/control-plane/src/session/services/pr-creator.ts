@@ -3,73 +3,196 @@
  */
 
 import type { PRCreator } from "./types";
-import type { ParticipantRepository, ArtifactRepository } from "../repository/types";
+import type {
+  MessageRepository,
+  ParticipantRepository,
+  ArtifactRepository,
+} from "../repository/types";
 import type { ParticipantRow } from "../types";
+import { createPullRequest } from "../../auth/pr";
 
 interface PRCreatorDependencies {
+  messageRepo: MessageRepository;
   participantRepo: ParticipantRepository;
   artifactRepo: ArtifactRepository;
-  sendToSandbox: (command: { type: string; branch: string }) => Promise<void>;
-  createGitHubPR: (data: {
-    branch: string;
-    title: string;
-    body: string;
-    token: string;
-  }) => Promise<{ number: number; html_url: string }>;
+  getSandboxWebSocket: () => WebSocket | null;
+  safeSend: (ws: WebSocket, message: unknown) => boolean;
+  registerPushPromise: (
+    branchName: string,
+    resolve: () => void,
+    reject: (err: Error) => void
+  ) => { timeoutId: ReturnType<typeof setTimeout> };
+  broadcast: (message: unknown) => void;
+  tokenEncryptionKey: string;
 }
 
 /**
  * Create a PRCreator instance.
  */
 export function createPRCreator(deps: PRCreatorDependencies): PRCreator {
-  const { participantRepo, artifactRepo, sendToSandbox, createGitHubPR } = deps;
+  const {
+    messageRepo,
+    participantRepo,
+    artifactRepo,
+    getSandboxWebSocket,
+    safeSend,
+    registerPushPromise,
+    broadcast,
+    tokenEncryptionKey,
+  } = deps;
 
   return {
-    async createPullRequest(data: { branch: string; title: string; body: string }): Promise<void> {
-      // Find participant with valid GitHub token
-      const participant = this.findParticipantWithToken();
-      if (!participant || !participant.github_access_token_encrypted) {
-        throw new Error("No participant with valid GitHub token found");
+    async getPromptingUser(): Promise<
+      | { user: ParticipantRow; error?: never; status?: never }
+      | { user?: never; error: string; status: number }
+    > {
+      // Find the currently processing message
+      const processingMessage = messageRepo.getProcessing();
+
+      if (!processingMessage) {
+        console.log("[PRCreator] No processing message found");
+        return {
+          error: "No active prompt found. PR creation must be triggered by a user prompt.",
+          status: 400,
+        };
       }
 
-      // Send push command to sandbox
-      await sendToSandbox({
-        type: "push_branch",
-        branch: data.branch,
-      });
+      const participantId = processingMessage.author_id;
 
-      // Create PR via GitHub API
-      const pr = await createGitHubPR({
-        branch: data.branch,
-        title: data.title,
-        body: data.body,
-        token: participant.github_access_token_encrypted,
-      });
+      // Get the participant record
+      const participant = participantRepo.getById(participantId);
 
-      // Store PR artifact
-      artifactRepo.create({
-        id: crypto.randomUUID(),
-        type: "pull_request",
-        url: pr.html_url,
-        metadata: JSON.stringify({
-          number: pr.number,
-          branch: data.branch,
-          title: data.title,
-        }),
-        createdAt: Date.now(),
-      });
+      if (!participant) {
+        console.log(`[PRCreator] Participant not found for id=${participantId}`);
+        return { error: "User not found. Please re-authenticate.", status: 401 };
+      }
+
+      if (!participant.github_access_token_encrypted) {
+        console.log(`[PRCreator] No GitHub token for user_id=${participant.user_id}`);
+        return {
+          error:
+            "Your GitHub token is not available for PR creation. Please reconnect to the session to re-authenticate.",
+          status: 401,
+        };
+      }
+
+      if (this.isTokenExpired(participant)) {
+        console.log(`[PRCreator] GitHub token expired for user_id=${participant.user_id}`);
+        return { error: "Your GitHub token has expired. Please re-authenticate.", status: 401 };
+      }
+
+      return { user: participant };
     },
 
-    findParticipantWithToken(): ParticipantRow | null {
-      const participants = participantRepo.list();
+    isTokenExpired(participant: ParticipantRow, bufferMs = 60000): boolean {
+      if (!participant.github_token_expires_at) {
+        return false; // No expiration set, assume valid
+      }
+      return Date.now() + bufferMs >= participant.github_token_expires_at;
+    },
 
-      for (const participant of participants) {
-        if (participant.github_access_token_encrypted) {
-          return participant;
-        }
+    async pushBranch(data: {
+      branchName: string;
+      repoOwner: string;
+      repoName: string;
+      githubToken?: string;
+    }): Promise<{ success: true } | { success: false; error: string }> {
+      const sandboxWs = getSandboxWebSocket();
+
+      if (!sandboxWs) {
+        // No sandbox connected - user may have already pushed manually
+        console.log("[PRCreator] No sandbox connected, assuming branch was pushed manually");
+        return { success: true };
       }
 
-      return null;
+      // Create a promise that will be resolved when push_complete event arrives
+      let storedTimeoutId: ReturnType<typeof setTimeout> | undefined;
+      const pushPromise = new Promise<void>((resolve, reject) => {
+        const { timeoutId } = registerPushPromise(data.branchName, resolve, reject);
+        storedTimeoutId = timeoutId;
+      });
+
+      // Tell sandbox to push the current branch
+      console.log(`[PRCreator] Sending push command for branch ${data.branchName}`);
+      safeSend(sandboxWs, {
+        type: "push",
+        branchName: data.branchName,
+        repoOwner: data.repoOwner,
+        repoName: data.repoName,
+        githubToken: data.githubToken,
+      });
+
+      // Wait for push_complete or push_error event
+      try {
+        await pushPromise;
+        console.log(`[PRCreator] Push completed successfully for branch ${data.branchName}`);
+        return { success: true };
+      } catch (pushError) {
+        console.error(`[PRCreator] Push failed: ${pushError}`);
+        return { success: false, error: `Failed to push branch: ${pushError}` };
+      } finally {
+        // Clean up timeout to prevent memory leaks
+        if (storedTimeoutId) {
+          clearTimeout(storedTimeoutId);
+        }
+      }
+    },
+
+    async createPR(data: {
+      title: string;
+      body: string;
+      baseBranch: string;
+      headBranch: string;
+      repoOwner: string;
+      repoName: string;
+      userToken: string;
+    }): Promise<{ prNumber: number; prUrl: string; state: string }> {
+      // Create the PR using GitHub API
+      const prResult = await createPullRequest(
+        {
+          accessTokenEncrypted: data.userToken,
+          owner: data.repoOwner,
+          repo: data.repoName,
+          title: data.title,
+          body: data.body,
+          head: data.headBranch,
+          base: data.baseBranch,
+        },
+        tokenEncryptionKey
+      );
+
+      // Store the PR as an artifact
+      const artifactId = crypto.randomUUID();
+      const now = Date.now();
+      artifactRepo.create({
+        id: artifactId,
+        type: "pr",
+        url: prResult.htmlUrl,
+        metadata: JSON.stringify({
+          number: prResult.number,
+          state: prResult.state,
+          head: data.headBranch,
+          base: data.baseBranch,
+        }),
+        createdAt: now,
+      });
+
+      // Broadcast PR creation to all clients
+      broadcast({
+        type: "artifact_created",
+        artifact: {
+          id: artifactId,
+          type: "pr",
+          url: prResult.htmlUrl,
+          prNumber: prResult.number,
+        },
+      });
+
+      return {
+        prNumber: prResult.number,
+        prUrl: prResult.htmlUrl,
+        state: prResult.state,
+      };
     },
   };
 }
