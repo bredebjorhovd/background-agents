@@ -50,7 +50,6 @@ import type {
   ServerMessage,
   SandboxEvent,
   SessionState,
-  ParticipantPresence,
 } from "../types";
 import type {
   SessionRow,
@@ -1967,7 +1966,7 @@ export class SessionDO extends DurableObject<Env> {
    */
   private sendPresence(ws: WebSocket): void {
     this.initServices();
-    const participants = this.getPresenceList();
+    const participants = this.presenceManager!.buildPresenceList(this.wsManager!.getClients());
     this.wsManager!.safeSend(ws, { type: "presence_sync", participants });
   }
 
@@ -1975,23 +1974,9 @@ export class SessionDO extends DurableObject<Env> {
    * Broadcast presence to all clients.
    */
   private broadcastPresence(): void {
-    const participants = this.getPresenceList();
-    this.broadcast({ type: "presence_update", participants });
-  }
-
-  /**
-   * Get list of present participants.
-   */
-  private getPresenceList(): ParticipantPresence[] {
     this.initServices();
-    return Array.from(this.wsManager!.getClients().values()).map((c) => ({
-      participantId: c.participantId,
-      userId: c.userId,
-      name: c.name,
-      avatar: c.avatar,
-      status: c.status,
-      lastSeen: c.lastSeen,
-    }));
+    const participants = this.presenceManager!.buildPresenceList(this.wsManager!.getClients());
+    this.broadcast({ type: "presence_update", participants });
   }
 
   /**
