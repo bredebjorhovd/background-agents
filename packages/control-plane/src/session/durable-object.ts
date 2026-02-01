@@ -148,8 +148,6 @@ interface InternalRoute {
 
 export class SessionDO extends DurableObject<Env> {
   private sql: SqlStorage;
-  private clients: Map<WebSocket, ClientInfo>;
-  private sandboxWs: WebSocket | null = null;
   private initialized = false;
   private isSpawningSandbox = false;
   // Track pending push operations by branch name
@@ -250,7 +248,6 @@ export class SessionDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.clients = new Map();
 
     // Initialize repositories
     this.messageRepo = createMessageRepository(this.sql);
@@ -321,33 +318,15 @@ export class SessionDO extends DurableObject<Env> {
       participantRepo: this.participantRepo,
       artifactRepo: this.artifactRepo,
       sendToSandbox: async (command) => {
-        if (this.sandboxWs) {
-          this.wsManager!.safeSend(this.sandboxWs, command);
+        const sandboxWs = this.wsManager!.getSandboxWebSocket();
+        if (sandboxWs) {
+          this.wsManager!.safeSend(sandboxWs, command);
         }
       },
       createGitHubPR: async (data) => {
         return await this.createGitHubPullRequest(data);
       },
     });
-  }
-
-  /**
-   * Safely send a message over a WebSocket, handling errors and closed connections.
-   * Returns true if the message was sent, false otherwise.
-   */
-  private safeSend(ws: WebSocket, message: string | object): boolean {
-    try {
-      if (ws.readyState !== WebSocket.OPEN) {
-        console.log(`[DO] Cannot send: WebSocket not open (state=${ws.readyState})`);
-        return false;
-      }
-      const data = typeof message === "string" ? message : JSON.stringify(message);
-      ws.send(data);
-      return true;
-    } catch (e) {
-      console.log(`[DO] WebSocket send failed: ${e}`);
-      return false;
-    }
   }
 
   /**
@@ -462,6 +441,7 @@ export class SessionDO extends DurableObject<Env> {
       console.log("DO: WebSocket accepted");
 
       if (isSandbox) {
+        this.initServices();
         // Close any existing sandbox WebSocket to prevent duplicates
         const existingSandboxWs = this.getSandboxWebSocket();
         if (existingSandboxWs && existingSandboxWs !== server) {
@@ -473,7 +453,7 @@ export class SessionDO extends DurableObject<Env> {
           }
         }
 
-        this.sandboxWs = server;
+        this.wsManager!.setSandboxWebSocket(server);
         this.isSpawningSandbox = false;
         this.updateSandboxStatus("ready");
         this.broadcast({ type: "sandbox_status", status: "ready" });
@@ -509,6 +489,9 @@ export class SessionDO extends DurableObject<Env> {
     console.log("DO: webSocketMessage received");
     if (typeof message !== "string") return;
 
+    // Ensure services are initialized before processing messages
+    this.initServices();
+
     const tags = this.ctx.getTags(ws);
     if (tags.includes("sandbox")) {
       await this.handleSandboxMessage(ws, message);
@@ -521,10 +504,11 @@ export class SessionDO extends DurableObject<Env> {
    * Handle WebSocket close.
    */
   async webSocketClose(ws: WebSocket, _code: number, _reason: string): Promise<void> {
+    this.initServices();
     const tags = this.ctx.getTags(ws);
 
     if (tags.includes("sandbox")) {
-      this.sandboxWs = null;
+      this.wsManager!.setSandboxWebSocket(null);
       // Allow sandbox to reconnect: only mark "stopped" when we intentionally stop (inactivity).
       // Unexpected close (network blip, container restart) → "connecting" so reconnect is accepted.
       const sandbox = this.getSandbox();
@@ -533,8 +517,8 @@ export class SessionDO extends DurableObject<Env> {
         this.broadcast({ type: "sandbox_status", status: "connecting" });
       }
     } else {
-      const client = this.clients.get(ws);
-      this.clients.delete(ws);
+      const client = this.wsManager!.getClients().get(ws);
+      this.wsManager!.removeClient(ws);
 
       if (client) {
         this.broadcast({ type: "presence_leave", userId: client.userId });
@@ -573,9 +557,12 @@ export class SessionDO extends DurableObject<Env> {
       return; // Already closed, nothing to do
     }
 
+    // Ensure services are initialized
+    this.initServices();
+
     // Check if this WebSocket has been authenticated
     // An authenticated WebSocket will be in the clients Map
-    if (this.clients.has(ws)) {
+    if (this.wsManager!.getClients().has(ws)) {
       return; // Authenticated, nothing to do
     }
 
@@ -691,15 +678,16 @@ export class SessionDO extends DurableObject<Env> {
         await this.triggerSnapshot("inactivity_timeout");
 
         // Send shutdown command to sandbox and close WebSocket
+        this.initServices();
         const sandboxWs = this.getSandboxWebSocket();
         if (sandboxWs) {
-          this.safeSend(sandboxWs, { type: "shutdown" });
+          this.wsManager!.safeSend(sandboxWs, { type: "shutdown" });
           try {
             sandboxWs.close(1000, "Inactivity timeout");
           } catch {
             // Ignore errors closing WebSocket
           }
-          this.sandboxWs = null;
+          this.wsManager!.setSandboxWebSocket(null);
         }
 
         this.broadcast({
@@ -995,8 +983,9 @@ export class SessionDO extends DurableObject<Env> {
    */
   private async handleSandboxMessage(ws: WebSocket, message: string): Promise<void> {
     // Recover sandbox WebSocket reference after hibernation
-    if (!this.sandboxWs || this.sandboxWs !== ws) {
-      this.sandboxWs = ws;
+    const currentSandboxWs = this.wsManager!.getSandboxWebSocket();
+    if (!currentSandboxWs || currentSandboxWs !== ws) {
+      this.wsManager!.setSandboxWebSocket(ws);
     }
 
     try {
@@ -1016,7 +1005,7 @@ export class SessionDO extends DurableObject<Env> {
 
       switch (data.type) {
         case "ping":
-          this.safeSend(ws, { type: "pong", timestamp: Date.now() });
+          this.wsManager!.safeSend(ws, { type: "pong", timestamp: Date.now() });
           break;
 
         case "subscribe":
@@ -1041,7 +1030,7 @@ export class SessionDO extends DurableObject<Env> {
       }
     } catch (e) {
       console.error("Error processing client message:", e);
-      this.safeSend(ws, {
+      this.wsManager!.safeSend(ws, {
         type: "error",
         code: "INVALID_MESSAGE",
         message: "Failed to process message",
@@ -1089,7 +1078,7 @@ export class SessionDO extends DurableObject<Env> {
       ws,
     };
 
-    this.clients.set(ws, clientInfo);
+    this.wsManager!.registerClient(ws, clientInfo);
 
     // Store WebSocket to participant mapping for hibernation recovery
     // Get the ws_id from the WebSocket's tags
@@ -1120,7 +1109,7 @@ export class SessionDO extends DurableObject<Env> {
 
     // Send session state with current participant info
     const state = this.getSessionState();
-    this.safeSend(ws, {
+    this.wsManager!.safeSend(ws, {
       type: "subscribed",
       sessionId: state.id,
       state,
@@ -1135,7 +1124,7 @@ export class SessionDO extends DurableObject<Env> {
     // Send historical events (messages and sandbox events)
     this.sendHistoricalEvents(ws);
     // Signal end of history so client can flush any pending token (assistant) text
-    this.safeSend(ws, { type: "history_complete" });
+    this.wsManager!.safeSend(ws, { type: "history_complete" });
 
     // Send current presence
     this.sendPresence(ws);
@@ -1179,7 +1168,7 @@ export class SessionDO extends DurableObject<Env> {
     for (const item of combined) {
       if (item.type === "message") {
         const msg = item.data as MessageWithParticipant;
-        this.safeSend(ws, {
+        this.wsManager!.safeSend(ws, {
           type: "sandbox_event",
           event: {
             type: "user_message",
@@ -1199,7 +1188,7 @@ export class SessionDO extends DurableObject<Env> {
         const event = item.data as EventRow;
         try {
           const eventData = JSON.parse(event.data) as Record<string, unknown>;
-          this.safeSend(ws, {
+          this.wsManager!.safeSend(ws, {
             type: "sandbox_event",
             event: {
               ...eventData,
@@ -1218,8 +1207,10 @@ export class SessionDO extends DurableObject<Env> {
    * Get client info for a WebSocket, reconstructing from storage if needed after hibernation.
    */
   private getClientInfo(ws: WebSocket): ClientInfo | null {
+    this.initServices();
+
     // First check in-memory cache
-    let client = this.clients.get(ws);
+    let client = this.wsManager!.getClients().get(ws);
     if (client) return client;
 
     // After hibernation, the Map is empty but WebSocket is still valid
@@ -1259,7 +1250,7 @@ export class SessionDO extends DurableObject<Env> {
             clientId: mapping.client_id || `client-${Date.now()}`,
             ws,
           };
-          this.clients.set(ws, client);
+          this.wsManager!.registerClient(ws, client);
           return client;
         }
       }
@@ -1286,7 +1277,7 @@ export class SessionDO extends DurableObject<Env> {
   ): Promise<void> {
     const client = this.getClientInfo(ws);
     if (!client) {
-      this.safeSend(ws, {
+      this.wsManager!.safeSend(ws, {
         type: "error",
         code: "NOT_SUBSCRIBED",
         message: "Must subscribe first",
@@ -1331,7 +1322,7 @@ export class SessionDO extends DurableObject<Env> {
     const position = (queueResult.one() as { count: number }).count;
 
     // Confirm to sender
-    this.safeSend(ws, {
+    this.wsManager!.safeSend(ws, {
       type: "prompt_queued",
       messageId,
       position,
@@ -1345,8 +1336,10 @@ export class SessionDO extends DurableObject<Env> {
    * Handle typing indicator (warm sandbox).
    */
   private async handleTyping(): Promise<void> {
+    this.initServices();
     // If no sandbox or not connected, try to warm/spawn one
-    if (!this.sandboxWs || this.sandboxWs.readyState !== WebSocket.OPEN) {
+    const sandboxWs = this.wsManager!.getSandboxWebSocket();
+    if (!sandboxWs || sandboxWs.readyState !== WebSocket.OPEN) {
       if (!this.isSpawningSandbox) {
         this.broadcast({ type: "sandbox_warming" });
         // Proactively spawn sandbox when user starts typing
@@ -1508,7 +1501,7 @@ export class SessionDO extends DurableObject<Env> {
     // Pass GitHub App token for authentication (sandbox uses for git push)
     // User's OAuth token is NOT sent to sandbox - only used server-side for PR API
     console.log(`[DO] Sending push command for branch ${branchName}`);
-    this.safeSend(sandboxWs, {
+    this.wsManager!.safeSend(sandboxWs, {
       type: "push",
       branchName,
       repoOwner,
@@ -1569,9 +1562,12 @@ export class SessionDO extends DurableObject<Env> {
    * Get the sandbox WebSocket, recovering from hibernation if needed.
    */
   private getSandboxWebSocket(): WebSocket | null {
+    this.initServices();
+
     // First check in-memory reference
-    if (this.sandboxWs && this.sandboxWs.readyState === WebSocket.OPEN) {
-      return this.sandboxWs;
+    const sandboxWs = this.wsManager!.getSandboxWebSocket();
+    if (sandboxWs && sandboxWs.readyState === WebSocket.OPEN) {
+      return sandboxWs;
     }
 
     // After hibernation, try to recover from ctx.getWebSockets()
@@ -1597,7 +1593,7 @@ export class SessionDO extends DurableObject<Env> {
           }
         }
         console.log("[DO] Recovered sandbox WebSocket from hibernation");
-        this.sandboxWs = ws;
+        this.wsManager!.setSandboxWebSocket(ws);
         return ws;
       }
     }
@@ -1679,7 +1675,7 @@ export class SessionDO extends DurableObject<Env> {
     };
 
     console.log("processMessageQueue: sending to sandbox");
-    this.safeSend(sandboxWs, command);
+    this.wsManager!.safeSend(sandboxWs, command);
     console.log("processMessageQueue: sent");
   }
 
@@ -1946,8 +1942,10 @@ export class SessionDO extends DurableObject<Env> {
    * The processing status will be updated when execution_complete is received.
    */
   private async stopExecution(): Promise<void> {
-    if (this.sandboxWs) {
-      this.safeSend(this.sandboxWs, { type: "stop" });
+    this.initServices();
+    const sandboxWs = this.wsManager!.getSandboxWebSocket();
+    if (sandboxWs) {
+      this.wsManager!.safeSend(sandboxWs, { type: "stop" });
     }
   }
 
@@ -1955,10 +1953,11 @@ export class SessionDO extends DurableObject<Env> {
    * Broadcast message to all connected clients.
    */
   private broadcast(message: ServerMessage): void {
+    this.initServices();
     for (const ws of this.ctx.getWebSockets()) {
       const tags = this.ctx.getTags(ws);
       if (!tags.includes("sandbox")) {
-        this.safeSend(ws, message);
+        this.wsManager!.safeSend(ws, message);
       }
     }
   }
@@ -1967,8 +1966,9 @@ export class SessionDO extends DurableObject<Env> {
    * Send presence info to a specific client.
    */
   private sendPresence(ws: WebSocket): void {
+    this.initServices();
     const participants = this.getPresenceList();
-    this.safeSend(ws, { type: "presence_sync", participants });
+    this.wsManager!.safeSend(ws, { type: "presence_sync", participants });
   }
 
   /**
@@ -1983,7 +1983,8 @@ export class SessionDO extends DurableObject<Env> {
    * Get list of present participants.
    */
   private getPresenceList(): ParticipantPresence[] {
-    return Array.from(this.clients.values()).map((c) => ({
+    this.initServices();
+    return Array.from(this.wsManager!.getClients().values()).map((c) => ({
       participantId: c.participantId,
       userId: c.userId,
       name: c.name,
@@ -2129,7 +2130,7 @@ export class SessionDO extends DurableObject<Env> {
       payload.viewportWidth = body.viewportWidth;
       payload.viewportHeight = body.viewportHeight;
     }
-    this.safeSend(sandboxWs, payload);
+    this.wsManager!.safeSend(sandboxWs, payload);
 
     try {
       const element = await elementPromise;
@@ -3414,9 +3415,13 @@ export class SessionDO extends DurableObject<Env> {
    * Send command to sandbox WebSocket.
    */
   private async sendCommandToSandbox(command: SandboxCommand): Promise<void> {
-    // TODO: Extract from existing logic
-    if (this.sandboxWs && this.wsManager) {
-      this.wsManager.safeSend(this.sandboxWs, command);
+    this.initServices();
+    const sandboxWs = this.wsManager!.getSandboxWebSocket();
+    if (sandboxWs) {
+      this.wsManager!.safeSend(sandboxWs, {
+        type: "execute",
+        ...command,
+      });
     }
   }
 
@@ -3424,8 +3429,9 @@ export class SessionDO extends DurableObject<Env> {
    * Spawn sandbox if not connected.
    */
   private async spawnSandboxIfNeeded(): Promise<void> {
-    // TODO: Extract from existing logic
-    if (!this.sandboxWs && !this.isSpawningSandbox) {
+    this.initServices();
+    const sandboxWs = this.wsManager!.getSandboxWebSocket();
+    if (!sandboxWs && !this.isSpawningSandbox) {
       await this.spawnSandbox();
     }
   }
