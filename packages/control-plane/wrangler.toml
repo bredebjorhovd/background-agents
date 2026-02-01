@@ -1,0 +1,15 @@
+# Minimal wrangler.toml for testing purposes
+# Actual deployment is managed via Terraform
+
+name = "open-inspect-control-plane"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[durable_objects.bindings]]
+name = "SESSION"
+class_name = "SessionDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionDO"]
