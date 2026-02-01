@@ -1230,18 +1230,15 @@ export class SessionDO extends DurableObject<Env> {
     }
 
     // Insert message with optional model override
-    this.sql.exec(
-      `INSERT INTO messages (id, author_id, content, source, model, attachments, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      messageId,
-      participant.id,
-      data.content,
-      "web",
-      messageModel,
-      data.attachments ? JSON.stringify(data.attachments) : null,
-      "pending",
-      now
-    );
+    this.messageRepo.create({
+      id: messageId,
+      authorId: participant.id,
+      content: data.content,
+      source: "web",
+      model: messageModel,
+      attachments: data.attachments ? JSON.stringify(data.attachments) : null,
+      createdAt: now,
+    });
 
     // Get queue position
     const queueResult = this.sql.exec(
@@ -1307,15 +1304,13 @@ export class SessionDO extends DurableObject<Env> {
     const messageId = eventMessageId ?? processingResult[0]?.id ?? null;
 
     // Store event
-    this.sql.exec(
-      `INSERT INTO events (id, type, data, message_id, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      eventId,
-      event.type,
-      JSON.stringify(event),
+    this.eventRepo.create({
+      id: eventId,
+      type: event.type,
+      data: JSON.stringify(event),
       messageId,
-      now
-    );
+      createdAt: now,
+    });
 
     // Handle specific event types
     if (event.type === "execution_complete") {
@@ -1585,12 +1580,7 @@ export class SessionDO extends DurableObject<Env> {
 
     // Get author info (use toArray since author may not exist in participants table)
     console.log("processMessageQueue: getting author", message.author_id);
-    const authorResult = this.sql.exec(
-      `SELECT * FROM participants WHERE id = ?`,
-      message.author_id
-    );
-    const authorRows = authorResult.toArray() as unknown as ParticipantRow[];
-    const author = authorRows[0] ?? null;
+    const author = this.participantRepo.getById(message.author_id);
     console.log("processMessageQueue: author found", !!author);
 
     // Get session for default model
@@ -1845,14 +1835,13 @@ export class SessionDO extends DurableObject<Env> {
           if (result.tunnelUrls) {
             metadata.tunnelUrls = result.tunnelUrls;
           }
-          this.sql.exec(
-            `INSERT INTO artifacts (id, type, url, metadata, created_at) VALUES (?, ?, ?, ?, ?)`,
-            artifactId,
-            "preview",
-            result.previewTunnelUrl,
-            JSON.stringify(metadata),
-            now
-          );
+          this.artifactRepo.create({
+            id: artifactId,
+            type: "preview",
+            url: result.previewTunnelUrl,
+            metadata: JSON.stringify(metadata),
+            createdAt: now,
+          });
           this.broadcast({
             type: "artifact_created",
             artifact: {
@@ -2107,40 +2096,20 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   private getParticipantByUserId(userId: string): ParticipantRow | null {
-    const result = this.sql.exec(`SELECT * FROM participants WHERE user_id = ?`, userId);
-    const rows = result.toArray() as unknown as ParticipantRow[];
-    return rows[0] ?? null;
+    return this.participantRepo.getByUserId(userId);
   }
 
   private createParticipant(userId: string, name: string): ParticipantRow {
     const id = generateId();
     const now = Date.now();
 
-    this.sql.exec(
-      `INSERT INTO participants (id, user_id, github_name, role, joined_at)
-       VALUES (?, ?, ?, ?, ?)`,
+    return this.participantRepo.create({
       id,
       userId,
-      name,
-      "member",
-      now
-    );
-
-    return {
-      id,
-      user_id: userId,
-      github_user_id: null,
-      github_login: null,
-      github_email: null,
-      github_name: name,
+      githubName: name,
       role: "member",
-      github_access_token_encrypted: null,
-      github_refresh_token_encrypted: null,
-      github_token_expires_at: null,
-      ws_auth_token: null,
-      ws_token_created_at: null,
-      joined_at: now,
-    };
+      joinedAt: now,
+    });
   }
 
   private updateSandboxStatus(status: string): void {
@@ -2590,18 +2559,15 @@ export class SessionDO extends DurableObject<Env> {
         "with author",
         participant.id
       );
-      this.sql.exec(
-        `INSERT INTO messages (id, author_id, content, source, attachments, callback_context, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        messageId,
-        participant.id, // Use the participant's row ID, not the user ID
-        body.content,
-        body.source,
-        body.attachments ? JSON.stringify(body.attachments) : null,
-        body.callbackContext ? JSON.stringify(body.callbackContext) : null,
-        "pending",
-        now
-      );
+      this.messageRepo.create({
+        id: messageId,
+        authorId: participant.id, // Use the participant's row ID, not the user ID
+        content: body.content,
+        source: body.source,
+        attachments: body.attachments ? JSON.stringify(body.attachments) : null,
+        callbackContext: body.callbackContext ? JSON.stringify(body.callbackContext) : null,
+        createdAt: now,
+      });
 
       console.log("handleEnqueuePrompt: message inserted, processing queue");
       await this.processMessageQueue();
@@ -2776,14 +2742,13 @@ export class SessionDO extends DurableObject<Env> {
         const url = body.url || null;
         const metadata = body.metadata ? JSON.stringify(body.metadata) : null;
 
-        this.sql.exec(
-          `INSERT INTO artifacts (id, type, url, metadata, created_at) VALUES (?, ?, ?, ?, ?)`,
-          artifactId,
-          artifactType,
+        this.artifactRepo.create({
+          id: artifactId,
+          type: artifactType,
           url,
           metadata,
-          now
-        );
+          createdAt: now,
+        });
 
         this.broadcast({
           type: "artifact_created",
@@ -2849,14 +2814,13 @@ export class SessionDO extends DurableObject<Env> {
         metadataObj.r2_key = r2Key;
 
         const now = Date.now();
-        this.sql.exec(
-          `INSERT INTO artifacts (id, type, url, metadata, created_at) VALUES (?, ?, ?, ?, ?)`,
-          artifactId,
-          "screenshot",
-          serveUrl,
-          JSON.stringify(metadataObj),
-          now
-        );
+        this.artifactRepo.create({
+          id: artifactId,
+          type: "screenshot",
+          url: serveUrl,
+          metadata: JSON.stringify(metadataObj),
+          createdAt: now,
+        });
 
         this.broadcast({
           type: "artifact_created",
@@ -3161,20 +3125,18 @@ export class SessionDO extends DurableObject<Env> {
       // Store the PR as an artifact
       const artifactId = generateId();
       const now = Date.now();
-      this.sql.exec(
-        `INSERT INTO artifacts (id, type, url, metadata, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
-        artifactId,
-        "pr",
-        prResult.htmlUrl,
-        JSON.stringify({
+      this.artifactRepo.create({
+        id: artifactId,
+        type: "pr",
+        url: prResult.htmlUrl,
+        metadata: JSON.stringify({
           number: prResult.number,
           state: prResult.state,
           head: headBranch,
           base: baseBranch,
         }),
-        now
-      );
+        createdAt: now,
+      });
 
       // Update session with branch name
       this.sql.exec(`UPDATE session SET branch_name = ? WHERE id = ?`, headBranch, session.id);
