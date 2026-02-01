@@ -17,8 +17,12 @@ multi-tenant system where users can only access repositories they are authorized
 
 - **Dynamic Discovery:** The system dynamically discovers which GitHub App installations the
   logged-in user has access to.
-- **Strict Scoping:**
-  - Users only see repositories they explicitly have access to.
+- **Strict Scoping (User Context):**
+  - **Repo Listing:** Repository lists are fetched using the **User's OAuth Token** (via
+    `GET /user/installations/{id}/repositories`). This ensures users only see repositories they
+    personally have access to, preventing leaks of restricted repos within an organization that the
+    App might technically have access to.
+- **Strict Scoping (App Context):**
   - **Sandboxes** receive a "scoped" GitHub token valid _only_ for the specific repository they are
     working on, preventing cross-repo data leaks even if the agent tries to access others.
 - **Database:** Session records include the `installationId` to enforce boundaries.
@@ -38,13 +42,18 @@ We need to propagate the `installationId` context across the stack.
 
 ### B. Control Plane (`packages/control-plane`)
 
-#### 1. Authorization & Discovery (`src/auth/github-app.ts`)
+#### 1. Authorization & Discovery (`src/auth/github-app.ts` / `src/auth/github.ts`)
 
 - **New Method:** `listUserInstallations(userAccessToken: string)`
   - Calls GitHub API `GET /user/installations` using the user's OAuth token.
   - Returns list of installations accessible to the user.
-- **Update Method:** `listInstallationRepositories(installationId, ...)`
-  - Must accept a specific `installationId` rather than using the global env var.
+- **New Method:** `listUserRepositories(userAccessToken: string, installationId: string)`
+  - **CRITICAL SECURITY:** Must use `GET /user/installations/{installation_id}/repositories`.
+  - Do **NOT** use `GET /installation/repositories` (which uses the App Token), as that lists _all_
+    repos the App can access, potentially leaking private/admin repos to unauthorized users in the
+    same org.
+- **Refactor:** `listInstallationRepositories` (App Token) remains only for backend/system usage
+  where User context is unavailable.
 
 #### 2. Router Logic (`src/router.ts`)
 
@@ -53,13 +62,13 @@ We need to propagate the `installationId` context across the stack.
   - **Logic:**
     1. Extract user's OAuth token from request headers.
     2. Call `listUserInstallations` to get accessible installations.
-    3. For each installation, fetch repositories.
+    3. For each installation, call `listUserRepositories`.
     4. Aggregate and return the distinct list of repos the user can access.
 - **`handleCreateSession`**:
   - **Input:** Accept `installationId` in the body.
   - **Validation:** Verify the user (via their OAuth token) actually has access to this
-    `installationId` before creating the session.
-  - **Storage:** Persist `installationId` in the Durable Object state.
+    `installationId` and repository before creating the session.
+  - **Storage:** Persist `installationId` in the Durable Object state via SQL migration.
 
 ### C. Web Client (`packages/web`)
 
@@ -100,12 +109,15 @@ This is the most critical security boundary.
 
 ### Phase 1: Shared Definitions
 
-1. Update `packages/shared/src/types.ts` with new fields.
+1. Update `packages/shared/src/types.ts` with new fields (`installationId`).
+2. Create SQL migration in `packages/control-plane/src/session/schema.ts` to add `installation_id`
+   to `session` table.
 
 ### Phase 2: Control Plane Logic
 
-1. Implement `listUserInstallations` in `github-app.ts`.
-2. Refactor `handleListRepos` to use dynamic discovery.
+1. Implement `listUserInstallations` and `listUserRepositories` in
+   `packages/control-plane/src/auth/github.ts` (using User Token).
+2. Refactor `handleListRepos` in `router.ts` to use dynamic discovery via User Token.
 3. Update `handleCreateSession` to store `installationId`.
 
 ### Phase 3: Web Frontend
