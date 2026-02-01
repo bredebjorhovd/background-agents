@@ -172,14 +172,41 @@ export interface MessageQueue {
  */
 export interface PRCreator {
   /**
-   * Create a pull request by pushing branch and creating PR on GitHub.
+   * Get the prompting user for PR creation (user who triggered the current message).
    */
-  createPullRequest(data: { branch: string; title: string; body: string }): Promise<void>;
+  getPromptingUser(): Promise<
+    | { user: ParticipantRow; error?: never; status?: never }
+    | { user?: never; error: string; status: number }
+  >;
 
   /**
-   * Find a participant with a valid GitHub access token.
+   * Check if a participant's GitHub token is expired.
    */
-  findParticipantWithToken(): ParticipantRow | null;
+  isTokenExpired(participant: ParticipantRow, bufferMs?: number): boolean;
+
+  /**
+   * Push branch to remote via sandbox WebSocket.
+   * Returns promise that resolves when push completes or rejects on error.
+   */
+  pushBranch(data: {
+    branchName: string;
+    repoOwner: string;
+    repoName: string;
+    githubToken?: string;
+  }): Promise<{ success: true } | { success: false; error: string }>;
+
+  /**
+   * Create a pull request via GitHub API and store as artifact.
+   */
+  createPR(data: {
+    title: string;
+    body: string;
+    baseBranch: string;
+    headBranch: string;
+    repoOwner: string;
+    repoName: string;
+    userToken: string;
+  }): Promise<{ prNumber: number; prUrl: string; state: string }>;
 }
 
 /**

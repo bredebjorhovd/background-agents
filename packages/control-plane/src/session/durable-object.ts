@@ -13,7 +13,7 @@ import { generateId, decryptToken, hashToken } from "../auth/crypto";
 import { generateInstallationToken, getGitHubAppConfig } from "../auth/github-app";
 import { createModalClient } from "../sandbox/client";
 import { getIssue } from "../linear/client";
-import { createPullRequest, getRepository } from "../auth/pr";
+import { getRepository } from "../auth/pr";
 import { generateBranchName, generateInternalToken } from "@open-inspect/shared";
 import {
   createMessageRepository,
@@ -315,17 +315,24 @@ export class SessionDO extends DurableObject<Env> {
 
     // Create PR creator
     this.prCreator = createPRCreator({
+      messageRepo: this.messageRepo,
       participantRepo: this.participantRepo,
       artifactRepo: this.artifactRepo,
-      sendToSandbox: async (command) => {
-        const sandboxWs = this.wsManager!.getSandboxWebSocket();
-        if (sandboxWs) {
-          this.wsManager!.safeSend(sandboxWs, command);
-        }
+      getSandboxWebSocket: () => this.wsManager!.getSandboxWebSocket(),
+      safeSend: (ws, message) => this.wsManager!.safeSend(ws, message),
+      registerPushPromise: (branchName, resolve, reject) => {
+        const normalizedBranch = this.normalizeBranchName(branchName);
+        const timeoutId = setTimeout(() => {
+          if (this.pendingPushResolvers.has(normalizedBranch)) {
+            this.pendingPushResolvers.delete(normalizedBranch);
+            reject(new Error("Push operation timed out after 180 seconds"));
+          }
+        }, 180000);
+        this.pendingPushResolvers.set(normalizedBranch, { resolve, reject });
+        return { timeoutId };
       },
-      createGitHubPR: async (data) => {
-        return await this.createGitHubPullRequest(data);
-      },
+      broadcast: (msg) => this.wsManager!.broadcast(msg),
+      tokenEncryptionKey: this.env.TOKEN_ENCRYPTION_KEY,
     });
   }
 
@@ -1251,71 +1258,6 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   /**
-   * Push a branch to remote via the sandbox.
-   * Sends push command to sandbox and waits for completion or error.
-   *
-   * @returns Success result or error message
-   */
-  private async pushBranchToRemote(
-    branchName: string,
-    repoOwner: string,
-    repoName: string,
-    githubToken?: string
-  ): Promise<{ success: true } | { success: false; error: string }> {
-    const sandboxWs = this.getSandboxWebSocket();
-
-    if (!sandboxWs) {
-      // No sandbox connected - user may have already pushed manually
-      console.log("[DO] No sandbox connected, assuming branch was pushed manually");
-      return { success: true };
-    }
-
-    // Create a promise that will be resolved when push_complete event arrives
-    // Use normalized branch name for map key to handle case/whitespace differences
-    const normalizedBranch = this.normalizeBranchName(branchName);
-    let timeoutId: ReturnType<typeof setTimeout> | undefined;
-
-    const pushPromise = new Promise<void>((resolve, reject) => {
-      this.pendingPushResolvers.set(normalizedBranch, { resolve, reject });
-
-      // Timeout after 180 seconds (3 minutes) - git push can take a while
-      timeoutId = setTimeout(() => {
-        if (this.pendingPushResolvers.has(normalizedBranch)) {
-          this.pendingPushResolvers.delete(normalizedBranch);
-          reject(new Error("Push operation timed out after 180 seconds"));
-        }
-      }, 180000);
-    });
-
-    // Tell sandbox to push the current branch
-    // Pass GitHub App token for authentication (sandbox uses for git push)
-    // User's OAuth token is NOT sent to sandbox - only used server-side for PR API
-    console.log(`[DO] Sending push command for branch ${branchName}`);
-    this.wsManager!.safeSend(sandboxWs, {
-      type: "push",
-      branchName,
-      repoOwner,
-      repoName,
-      githubToken,
-    });
-
-    // Wait for push_complete or push_error event
-    try {
-      await pushPromise;
-      console.log(`[DO] Push completed successfully for branch ${branchName}`);
-      return { success: true };
-    } catch (pushError) {
-      console.error(`[DO] Push failed: ${pushError}`);
-      return { success: false, error: `Failed to push branch: ${pushError}` };
-    } finally {
-      // Clean up timeout to prevent memory leaks
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-      }
-    }
-  }
-
-  /**
    * Handle push completion or error events from sandbox.
    * Resolves or rejects the pending push promise for the branch.
    */
@@ -1803,65 +1745,6 @@ export class SessionDO extends DurableObject<Env> {
     }
 
     console.error(`[DO] Failed to notify slack-bot after retries for message ${messageId}`);
-  }
-
-  /**
-   * Check if a participant's GitHub token is expired.
-   * Returns true if expired or will expire within buffer time.
-   */
-  private isGitHubTokenExpired(participant: ParticipantRow, bufferMs = 60000): boolean {
-    if (!participant.github_token_expires_at) {
-      return false; // No expiration set, assume valid
-    }
-    return Date.now() + bufferMs >= participant.github_token_expires_at;
-  }
-
-  /**
-   * Get the prompting user for PR creation.
-   * Returns the participant who triggered the currently processing message.
-   */
-  private async getPromptingUserForPR(): Promise<
-    | { user: ParticipantRow; error?: never; status?: never }
-    | { user?: never; error: string; status: number }
-  > {
-    // Find the currently processing message
-    const processingMessage = this.messageRepo.getProcessing();
-
-    if (!processingMessage) {
-      console.log("[DO] PR creation failed: no processing message found");
-      return {
-        error: "No active prompt found. PR creation must be triggered by a user prompt.",
-        status: 400,
-      };
-    }
-
-    const participantId = processingMessage.author_id;
-
-    // Get the participant record
-    const participant = this.participantRepo.getById(participantId);
-
-    if (!participant) {
-      console.log(`[DO] PR creation failed: participant not found for id=${participantId}`);
-      return { error: "User not found. Please re-authenticate.", status: 401 };
-    }
-
-    if (!participant.github_access_token_encrypted) {
-      console.log(`[DO] PR creation failed: no GitHub token for user_id=${participant.user_id}`);
-      return {
-        error:
-          "Your GitHub token is not available for PR creation. Please reconnect to the session to re-authenticate.",
-        status: 401,
-      };
-    }
-
-    if (this.isGitHubTokenExpired(participant)) {
-      console.log(
-        `[DO] PR creation failed: GitHub token expired for user_id=${participant.user_id}`
-      );
-      return { error: "Your GitHub token has expired. Please re-authenticate.", status: 401 };
-    }
-
-    return { user: participant };
   }
 
   // HTTP handlers
@@ -2627,6 +2510,8 @@ export class SessionDO extends DurableObject<Env> {
    * 3. Create PR using GitHub API
    */
   private async handleCreatePR(request: Request): Promise<Response> {
+    this.initServices();
+
     const body = (await request.json()) as {
       title: string;
       body: string;
@@ -2639,7 +2524,7 @@ export class SessionDO extends DurableObject<Env> {
     }
 
     // Get the prompting user who will create the PR
-    const promptingUser = await this.getPromptingUserForPR();
+    const promptingUser = await this.prCreator!.getPromptingUser();
     if (!promptingUser.user) {
       return Response.json({ error: promptingUser.error }, { status: promptingUser.status });
     }
@@ -2676,12 +2561,12 @@ export class SessionDO extends DurableObject<Env> {
       }
 
       // Push branch to remote via sandbox
-      const pushResult = await this.pushBranchToRemote(
-        headBranch,
-        session.repo_owner,
-        session.repo_name,
-        pushToken
-      );
+      const pushResult = await this.prCreator!.pushBranch({
+        branchName: headBranch,
+        repoOwner: session.repo_owner,
+        repoName: session.repo_name,
+        githubToken: pushToken,
+      });
 
       if (!pushResult.success) {
         return Response.json({ error: pushResult.error }, { status: 500 });
@@ -2692,53 +2577,23 @@ export class SessionDO extends DurableObject<Env> {
       const sessionUrl = `${webAppUrl}/session/${sessionId}`;
       const fullBody = body.body + `\n\n---\n*Created with [Open-Inspect](${sessionUrl})*`;
 
-      // Create the PR using GitHub API (using the prompting user's token)
-      const prResult = await createPullRequest(
-        {
-          accessTokenEncrypted: user.github_access_token_encrypted!,
-          owner: session.repo_owner,
-          repo: session.repo_name,
-          title: body.title,
-          body: fullBody,
-          head: headBranch,
-          base: baseBranch,
-        },
-        this.env.TOKEN_ENCRYPTION_KEY
-      );
-
-      // Store the PR as an artifact
-      const artifactId = generateId();
-      const now = Date.now();
-      this.artifactRepo.create({
-        id: artifactId,
-        type: "pr",
-        url: prResult.htmlUrl,
-        metadata: JSON.stringify({
-          number: prResult.number,
-          state: prResult.state,
-          head: headBranch,
-          base: baseBranch,
-        }),
-        createdAt: now,
+      // Create the PR using GitHub API and store artifact
+      const prResult = await this.prCreator!.createPR({
+        title: body.title,
+        body: fullBody,
+        baseBranch,
+        headBranch,
+        repoOwner: session.repo_owner,
+        repoName: session.repo_name,
+        userToken: user.github_access_token_encrypted!,
       });
 
       // Update session with branch name
       this.sessionRepo.update({ branchName: headBranch });
 
-      // Broadcast PR creation to all clients
-      this.broadcast({
-        type: "artifact_created",
-        artifact: {
-          id: artifactId,
-          type: "pr",
-          url: prResult.htmlUrl,
-          prNumber: prResult.number,
-        },
-      });
-
       return Response.json({
-        prNumber: prResult.number,
-        prUrl: prResult.htmlUrl,
+        prNumber: prResult.prNumber,
+        prUrl: prResult.prUrl,
         state: prResult.state,
       });
     } catch (error) {
