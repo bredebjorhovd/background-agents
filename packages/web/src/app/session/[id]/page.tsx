@@ -11,23 +11,11 @@ import { SessionRightSidebar } from "@/components/session-right-sidebar";
 import { ActionBar } from "@/components/action-bar";
 import { PreviewPanel, type SelectedElementInfo } from "@/components/preview-panel";
 import { VSCodePanel } from "@/components/vscode-panel";
-import { AgentViewPanel } from "@/components/agent-view-panel";
 import { formatModelNameLower } from "@/lib/format";
 import type { SandboxEvent } from "@/lib/tool-formatters";
 
 // Tab types for the main content area
-type MainTab = "chat" | "preview" | "code" | "agent-view";
-
-// Stream frame type (matches control-plane types)
-interface StreamFrame {
-  frameNumber: number;
-  frameHash: string;
-  timestamp: number;
-  imageData: string;
-  imageType: "jpeg" | "png";
-  width: number;
-  height: number;
-}
+type MainTab = "chat" | "preview" | "code";
 
 // Event grouping types
 type EventGroup =
@@ -148,8 +136,6 @@ export default function SessionPage() {
     artifacts,
     currentParticipantId,
     isProcessing,
-    latestStreamFrame,
-    isStreaming,
     sendPrompt,
     stopExecution,
     sendTyping,
@@ -292,8 +278,6 @@ export default function SessionPage() {
         inputRef={inputRef}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
-        latestStreamFrame={latestStreamFrame}
-        isStreaming={isStreaming}
         handleSubmit={handleSubmit}
         handleInputChange={handleInputChange}
         handleKeyDown={handleKeyDown}
@@ -330,8 +314,6 @@ function SessionContent({
   inputRef,
   activeTab,
   setActiveTab,
-  latestStreamFrame,
-  isStreaming,
   handleSubmit,
   handleInputChange,
   handleKeyDown,
@@ -363,8 +345,6 @@ function SessionContent({
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
   activeTab: MainTab;
   setActiveTab: (tab: MainTab) => void;
-  latestStreamFrame: StreamFrame | null;
-  isStreaming: boolean;
   handleSubmit: (e: React.FormEvent) => void;
   handleInputChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
   handleKeyDown: (e: React.KeyboardEvent) => void;
@@ -486,14 +466,6 @@ function SessionContent({
         >
           Code
         </TabButton>
-        <TabButton
-          active={activeTab === "agent-view"}
-          onClick={() => setActiveTab("agent-view")}
-          icon={<MonitorIcon className="w-4 h-4" />}
-          badge={isStreaming ? "live" : undefined}
-        >
-          Agent View
-        </TabButton>
       </div>
 
       {/* Main content */}
@@ -526,17 +498,9 @@ function SessionContent({
               onSelectElement={setSelectedElement}
             />
           </div>
-        ) : activeTab === "code" ? (
-          <div className="flex-1">
-            <VSCodePanel artifacts={artifacts} sessionId={sessionId} />
-          </div>
         ) : (
           <div className="flex-1">
-            <AgentViewPanel
-              sessionId={sessionId}
-              latestFrame={latestStreamFrame}
-              isStreaming={isStreaming}
-            />
+            <VSCodePanel artifacts={artifacts} sessionId={sessionId} />
           </div>
         )}
 
@@ -771,19 +735,6 @@ function CodeIcon({ className }: { className?: string }) {
         strokeLinejoin="round"
         strokeWidth={2}
         d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"
-      />
-    </svg>
-  );
-}
-
-function MonitorIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth={2}
-        d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"
       />
     </svg>
   );

@@ -354,28 +354,6 @@ export async function handleGetPreviewUrl(
 }
 
 /**
- * Stream a frame to the session.
- * POST /sessions/:id/stream-frame
- */
-export async function handleStreamFrame(
-  request: Request,
-  env: Env,
-  match: RegExpMatchArray
-): Promise<Response> {
-  const stub = getSessionStub(env, match);
-  if (!stub) return error("Session ID required");
-
-  // Forward the stream frame to the Durable Object
-  return stub.fetch(
-    new Request("http://internal/internal/stream-frame", {
-      method: "POST",
-      headers: request.headers,
-      body: request.body,
-    })
-  );
-}
-
-/**
  * Get session messages.
  * GET /sessions/:id/messages
  */

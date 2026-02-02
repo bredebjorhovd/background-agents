@@ -241,10 +241,6 @@ class SandboxSupervisor:
             if start_vscode_js.exists():
                 shutil.copy(start_vscode_js, tool_dest / "start-vscode.js")
                 print("[supervisor] Copied start-vscode tool")
-            start_stream_js = Path("/app/sandbox/start-stream.js")
-            if start_stream_js.exists():
-                shutil.copy(start_stream_js, tool_dest / "start-stream.js")
-                print("[supervisor] Copied start-stream tool")
             capture_before_after_js = Path("/app/sandbox/capture-before-after.js")
             if capture_before_after_js.exists():
                 shutil.copy(capture_before_after_js, tool_dest / "capture-before-after.js")

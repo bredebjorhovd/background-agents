@@ -22,7 +22,6 @@ export const SANDBOX_AUTH_ROUTES: RegExp[] = [
   /^\/sessions\/[^/]+\/pr$/, // PR creation from sandbox
   /^\/sessions\/[^/]+\/artifacts$/, // Artifact upload (screenshot, preview) from sandbox
   /^\/sessions\/[^/]+\/preview-url$/, // Get preview tunnel URL (sandbox)
-  /^\/sessions\/[^/]+\/stream-frame$/, // Screenshot stream frames from sandbox
 ];
 
 /**

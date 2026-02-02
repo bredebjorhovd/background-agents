@@ -224,11 +224,6 @@ export class SessionDO extends DurableObject<Env> {
     },
     {
       method: "POST",
-      path: "/internal/stream-frame",
-      handler: (req) => this.handleStreamFrame(req),
-    },
-    {
-      method: "POST",
       path: "/internal/element-at-point",
       handler: (req) => this.handleElementAtPoint(req),
     },
@@ -2353,56 +2348,6 @@ export class SessionDO extends DurableObject<Env> {
       }
     }
     return Response.json({ url, availablePorts });
-  }
-
-  /**
-   * Handle incoming stream frames from the sandbox screenshot streamer.
-   * Broadcasts frames to all connected WebSocket clients.
-   */
-  private async handleStreamFrame(request: Request): Promise<Response> {
-    try {
-      const body = (await request.json()) as {
-        type?: string;
-        imageData?: string;
-        frameNumber?: number;
-        frameHash?: string;
-        timestamp?: number;
-        imageType?: string;
-        width?: number;
-        height?: number;
-      };
-
-      // Validate required fields
-      if (!body.type || body.type !== "screenshot_frame") {
-        return Response.json({ error: "Invalid frame type" }, { status: 400 });
-      }
-
-      if (!body.imageData || body.frameNumber === undefined) {
-        return Response.json({ error: "Missing required fields" }, { status: 400 });
-      }
-
-      // Broadcast the frame to all connected clients
-      // Clients can filter by message type to only show stream frames
-      const message: ServerMessage = {
-        type: "stream_frame",
-        frame: {
-          frameNumber: body.frameNumber,
-          frameHash: body.frameHash || "",
-          timestamp: body.timestamp ?? Date.now() / 1000,
-          imageData: body.imageData,
-          imageType: body.imageType === "png" ? "png" : "jpeg",
-          width: body.width ?? 1280,
-          height: body.height ?? 720,
-        },
-      };
-
-      this.broadcast(message);
-
-      return Response.json({ success: true, frameNumber: body.frameNumber });
-    } catch (error) {
-      console.error("[DO] Stream frame error:", error);
-      return Response.json({ error: "Invalid request body" }, { status: 400 });
-    }
   }
 
   /**

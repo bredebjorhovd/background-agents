@@ -93,17 +93,6 @@ export type ClientMessage =
       cursor?: { line: number; file: string };
     };
 
-// Stream frame data for real-time screenshot streaming
-export interface StreamFrame {
-  frameNumber: number;
-  frameHash: string;
-  timestamp: number;
-  imageData: string; // Base64-encoded image
-  imageType: "jpeg" | "png";
-  width: number;
-  height: number;
-}
-
 // Server → Client messages
 export type ServerMessage =
   | { type: "pong"; timestamp: number }
@@ -140,7 +129,6 @@ export type ServerMessage =
   | { type: "sandbox_warning"; message: string }
   | { type: "session_status"; status: SessionStatus }
   | { type: "processing_status"; isProcessing: boolean }
-  | { type: "stream_frame"; frame: StreamFrame }
   | { type: "history_complete" }
   | {
       type: "session_state_patch";

@@ -71,17 +71,6 @@ interface Participant {
   lastSeen: number;
 }
 
-// Stream frame type for real-time screenshot streaming
-interface StreamFrame {
-  frameNumber: number;
-  frameHash: string;
-  timestamp: number;
-  imageData: string;
-  imageType: "jpeg" | "png";
-  width: number;
-  height: number;
-}
-
 interface UseSessionSocketReturn {
   connected: boolean;
   connecting: boolean;
@@ -94,8 +83,6 @@ interface UseSessionSocketReturn {
   artifacts: Artifact[];
   currentParticipantId: string | null;
   isProcessing: boolean;
-  latestStreamFrame: StreamFrame | null;
-  isStreaming: boolean;
   sendPrompt: (content: string, model?: string) => void;
   stopExecution: () => void;
   sendTyping: () => void;
@@ -123,9 +110,6 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [currentParticipantId, setCurrentParticipantId] = useState<string | null>(null);
-  const [latestStreamFrame, setLatestStreamFrame] = useState<StreamFrame | null>(null);
-  const [isStreaming, setIsStreaming] = useState(false);
-  const streamTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const currentParticipantRef = useRef<{
     participantId: string;
     name: string;
@@ -149,7 +133,6 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
       participantId?: string;
       participant?: { participantId: string; name: string; avatar?: string };
       isProcessing?: boolean;
-      frame?: StreamFrame;
       patch?: { linearIssueId?: string | null; linearTeamId?: string | null };
     }) => {
       switch (data.type) {
@@ -339,21 +322,6 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
 
         case "pong":
           // Health check response
-          break;
-
-        case "stream_frame":
-          // Handle incoming screenshot stream frame
-          if (data.frame) {
-            setLatestStreamFrame(data.frame);
-            setIsStreaming(true);
-            // Reset streaming state after 5 seconds of no frames
-            if (streamTimeoutRef.current) {
-              clearTimeout(streamTimeoutRef.current);
-            }
-            streamTimeoutRef.current = setTimeout(() => {
-              setIsStreaming(false);
-            }, 5000);
-          }
           break;
 
         case "error":
@@ -632,8 +600,6 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
     artifacts,
     currentParticipantId,
     isProcessing,
-    latestStreamFrame,
-    isStreaming,
     sendPrompt,
     stopExecution,
     sendTyping,

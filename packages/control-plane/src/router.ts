@@ -26,7 +26,6 @@ import {
   handlePostArtifact,
   handleGetArtifactFile,
   handleGetPreviewUrl,
-  handleStreamFrame,
   handleSessionMessages,
   handleCreatePR,
   handleSessionWsToken,
@@ -124,11 +123,6 @@ const routes: Route[] = [
     method: "GET",
     pattern: parsePattern("/sessions/:id/preview-url"),
     handler: handleGetPreviewUrl,
-  },
-  {
-    method: "POST",
-    pattern: parsePattern("/sessions/:id/stream-frame"),
-    handler: handleStreamFrame,
   },
   {
     method: "GET",
