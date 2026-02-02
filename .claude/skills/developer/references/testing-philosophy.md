@@ -4,7 +4,8 @@
 
 ### The Red-Green-Refactor Cycle
 
-TDD is not just about writing tests—it's a design discipline that forces you to think about contracts before implementation.
+TDD is not just about writing tests—it's a design discipline that forces you to think about
+contracts before implementation.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -41,15 +42,13 @@ TDD is not just about writing tests—it's a design discipline that forces you t
 **Feature:** Add message to session
 
 **Step 1: RED**
+
 ```typescript
 // domain/entities/Session.test.ts
-describe('Session', () => {
-  it('should add message to session', () => {
-    const session = Session.create(
-      SessionId.generate(),
-      RepoRef.create('owner', 'repo')
-    );
-    const message = Message.create(MessageId.generate(), 'Hello');
+describe("Session", () => {
+  it("should add message to session", () => {
+    const session = Session.create(SessionId.generate(), RepoRef.create("owner", "repo"));
+    const message = Message.create(MessageId.generate(), "Hello");
 
     const updated = session.addMessage(message);
 
@@ -62,6 +61,7 @@ describe('Session', () => {
 **Run test → it fails (method doesn't exist)**
 
 **Step 2: GREEN**
+
 ```typescript
 // domain/entities/Session.ts
 export class Session {
@@ -131,6 +131,7 @@ Code is already simple. Nothing to refactor. Move to next test.
 ### Fake Example (Preferred)
 
 **TypeScript:**
+
 ```typescript
 // tests/fakes/InMemorySessionRepository.ts
 export class InMemorySessionRepository implements SessionRepository {
@@ -158,11 +159,12 @@ export class InMemorySessionRepository implements SessionRepository {
 const repo = new InMemorySessionRepository();
 const useCase = new CreateSession(repo, gitService);
 
-await useCase.execute('owner', 'repo');
+await useCase.execute("owner", "repo");
 expect(repo.count()).toBe(1);
 ```
 
 **Python:**
+
 ```python
 # tests/fakes/in_memory_session_repository.py
 class InMemorySessionRepository(SessionRepository):
@@ -206,10 +208,10 @@ Only for external dependencies you don't control:
 // Stub external GitHub API
 const githubApi = {
   getRepository: async () => ({
-    owner: 'owner',
-    name: 'repo',
-    defaultBranch: 'main'
-  })
+    owner: "owner",
+    name: "repo",
+    defaultBranch: "main",
+  }),
 };
 
 const gitService = new GitServiceAdapter(githubApi);
@@ -222,13 +224,13 @@ Only when you must verify interaction patterns:
 ```typescript
 // Mock event publisher to verify event was published
 const eventPublisher = {
-  publish: jest.fn()
+  publish: jest.fn(),
 };
 
-await useCase.execute('owner', 'repo');
+await useCase.execute("owner", "repo");
 
 expect(eventPublisher.publish).toHaveBeenCalledWith(
-  expect.objectContaining({ type: 'SessionCreated' })
+  expect.objectContaining({ type: "SessionCreated" })
 );
 ```
 
@@ -241,13 +243,10 @@ expect(eventPublisher.publish).toHaveBeenCalledWith(
 Every test follows this pattern:
 
 ```typescript
-it('should add message to session', () => {
+it("should add message to session", () => {
   // ARRANGE - Set up test data
-  const session = Session.create(
-    SessionId.generate(),
-    RepoRef.create('owner', 'repo')
-  );
-  const message = Message.create(MessageId.generate(), 'Hello');
+  const session = Session.create(SessionId.generate(), RepoRef.create("owner", "repo"));
+  const message = Message.create(MessageId.generate(), "Hello");
 
   // ACT - Execute the behavior
   const updated = session.addMessage(message);
@@ -263,17 +262,19 @@ it('should add message to session', () => {
 Use descriptive names that explain behavior:
 
 ✅ **Good:**
+
 ```typescript
-it('should create new session with empty messages')
-it('should throw error when repository name is empty')
-it('should restore session from snapshot')
+it("should create new session with empty messages");
+it("should throw error when repository name is empty");
+it("should restore session from snapshot");
 ```
 
 ❌ **Bad:**
+
 ```typescript
-it('works')
-it('test1')
-it('addMessage')
+it("works");
+it("test1");
+it("addMessage");
 ```
 
 ## Testing Each Layer
@@ -281,6 +282,7 @@ it('addMessage')
 ### Domain Layer Tests
 
 **What to test:**
+
 - Entity behavior and invariants
 - Value object validation
 - Pure business logic
@@ -289,16 +291,16 @@ it('addMessage')
 
 ```typescript
 // domain/entities/Session.test.ts
-describe('Session', () => {
-  describe('create', () => {
-    it('should create session with empty messages', () => {
+describe("Session", () => {
+  describe("create", () => {
+    it("should create session with empty messages", () => {
       const session = Session.create(id, repoRef);
       expect(session.messages).toHaveLength(0);
     });
   });
 
-  describe('addMessage', () => {
-    it('should return new session with added message', () => {
+  describe("addMessage", () => {
+    it("should return new session with added message", () => {
       const session = Session.create(id, repoRef);
       const updated = session.addMessage(message);
 
@@ -312,6 +314,7 @@ describe('Session', () => {
 ### Application Layer Tests
 
 **What to test:**
+
 - Use case orchestration
 - Port interactions
 - Error handling
@@ -320,7 +323,7 @@ describe('Session', () => {
 
 ```typescript
 // application/usecases/CreateSession.test.ts
-describe('CreateSession', () => {
+describe("CreateSession", () => {
   let sessionRepo: InMemorySessionRepository;
   let gitService: FakeGitService;
   let useCase: CreateSession;
@@ -331,21 +334,21 @@ describe('CreateSession', () => {
     useCase = new CreateSession(sessionRepo, gitService);
   });
 
-  it('should create and persist session', async () => {
-    const sessionId = await useCase.execute('owner', 'repo');
+  it("should create and persist session", async () => {
+    const sessionId = await useCase.execute("owner", "repo");
 
     const saved = await sessionRepo.findById(sessionId);
     expect(saved).not.toBeNull();
-    expect(saved!.repoRef.owner).toBe('owner');
+    expect(saved!.repoRef.owner).toBe("owner");
   });
 
-  it('should clone repository', async () => {
-    await useCase.execute('owner', 'repo');
+  it("should clone repository", async () => {
+    await useCase.execute("owner", "repo");
 
     expect(gitService.clonedRepos).toHaveLength(1);
     expect(gitService.clonedRepos[0]).toEqual({
-      owner: 'owner',
-      name: 'repo'
+      owner: "owner",
+      name: "repo",
     });
   });
 });
@@ -354,6 +357,7 @@ describe('CreateSession', () => {
 ### Infrastructure Layer Tests
 
 **What to test:**
+
 - Adapter implementation correctness
 - Database queries (integration tests)
 - API client behavior
@@ -362,12 +366,12 @@ describe('CreateSession', () => {
 
 ```typescript
 // infrastructure/persistence/SqliteSessionRepository.test.ts
-describe('SqliteSessionRepository', () => {
+describe("SqliteSessionRepository", () => {
   let db: Database;
   let repo: SqliteSessionRepository;
 
   beforeEach(async () => {
-    db = new Database(':memory:'); // In-memory SQLite
+    db = new Database(":memory:"); // In-memory SQLite
     await runMigrations(db);
     repo = new SqliteSessionRepository(db);
   });
@@ -376,7 +380,7 @@ describe('SqliteSessionRepository', () => {
     await db.close();
   });
 
-  it('should save and retrieve session', async () => {
+  it("should save and retrieve session", async () => {
     const session = Session.create(id, repoRef);
 
     await repo.save(session);
@@ -402,39 +406,50 @@ But focus on **critical paths**, not just percentages:
 ## Common Testing Mistakes
 
 ❌ **Testing implementation details**
+
 ```typescript
-it('should call repository.save()', async () => {
+it("should call repository.save()", async () => {
   const repo = mock<SessionRepository>();
-  await useCase.execute('owner', 'repo');
+  await useCase.execute("owner", "repo");
   expect(repo.save).toHaveBeenCalled(); // Couples to implementation
 });
 ```
 
 ✅ **Test outcomes**
+
 ```typescript
-it('should persist session', async () => {
+it("should persist session", async () => {
   const repo = new InMemorySessionRepository();
-  await useCase.execute('owner', 'repo');
+  await useCase.execute("owner", "repo");
   expect(repo.count()).toBe(1); // Tests behavior
 });
 ```
 
 ❌ **Multiple assertions for unrelated things**
+
 ```typescript
-it('should do many things', async () => {
+it("should do many things", async () => {
   // Tests session creation, message adding, snapshot creation...
   // If this fails, which part broke?
 });
 ```
 
 ✅ **One logical assertion per test**
+
 ```typescript
-it('should create session with empty messages', () => { /* ... */ });
-it('should add message to session', () => { /* ... */ });
-it('should create snapshot from session', () => { /* ... */ });
+it("should create session with empty messages", () => {
+  /* ... */
+});
+it("should add message to session", () => {
+  /* ... */
+});
+it("should create snapshot from session", () => {
+  /* ... */
+});
 ```
 
 ❌ **Mocking everything**
+
 ```typescript
 const repo = mock<SessionRepository>();
 const git = mock<GitService>();
@@ -443,6 +458,7 @@ const events = mock<EventPublisher>();
 ```
 
 ✅ **Using fakes**
+
 ```typescript
 const repo = new InMemorySessionRepository();
 const git = new FakeGitService();

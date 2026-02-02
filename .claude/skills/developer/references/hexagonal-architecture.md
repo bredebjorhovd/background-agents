@@ -2,7 +2,9 @@
 
 ## Overview
 
-Hexagonal architecture (also known as Ports and Adapters) organizes code into three distinct layers with strict dependency rules. The goal is to isolate business logic from external concerns, making the system more testable, maintainable, and adaptable to change.
+Hexagonal architecture (also known as Ports and Adapters) organizes code into three distinct layers
+with strict dependency rules. The goal is to isolate business logic from external concerns, making
+the system more testable, maintainable, and adaptable to change.
 
 ## The Three Layers
 
@@ -62,6 +64,7 @@ Hexagonal architecture (also known as Ports and Adapters) organizes code into th
 ### Domain Layer (Core)
 
 **What it contains:**
+
 - Business entities (Session, Message, Snapshot)
 - Value objects (SessionId, RepoRef, MessageId)
 - Domain logic and invariants
@@ -70,6 +73,7 @@ Hexagonal architecture (also known as Ports and Adapters) organizes code into th
 **Dependency rule:** Depends on NOTHING. Zero imports from application or infrastructure.
 
 **Example (TypeScript):**
+
 ```typescript
 // domain/entities/Session.ts
 export class Session {
@@ -85,11 +89,7 @@ export class Session {
 
   // Pure function - returns new Session, never mutates
   addMessage(message: Message): Session {
-    return new Session(
-      this.id,
-      this.repoRef,
-      [...this.messages, message]
-    );
+    return new Session(this.id, this.repoRef, [...this.messages, message]);
   }
 
   createSnapshot(): Snapshot {
@@ -99,6 +99,7 @@ export class Session {
 ```
 
 **Example (Python):**
+
 ```python
 # domain/entities/session.py
 from dataclasses import dataclass, replace
@@ -125,14 +126,17 @@ class Session:
 ### Application Layer (Use Cases)
 
 **What it contains:**
+
 - Use cases / commands that orchestrate domain objects
 - Port interfaces (abstract interfaces for external dependencies)
 - API endpoint handlers (HTTP, WebSocket, etc.)
 - Application services that coordinate multiple operations
 
-**Dependency rule:** Depends ONLY on domain layer. Uses port interfaces (abstractions), not concrete implementations.
+**Dependency rule:** Depends ONLY on domain layer. Uses port interfaces (abstractions), not concrete
+implementations.
 
 **Example (TypeScript):**
+
 ```typescript
 // application/ports/SessionRepository.ts
 export interface SessionRepository {
@@ -143,8 +147,8 @@ export interface SessionRepository {
 // application/usecases/CreateSession.ts
 export class CreateSession {
   constructor(
-    private readonly sessionRepo: SessionRepository,  // Port, not implementation
-    private readonly gitService: GitService           // Port, not implementation
+    private readonly sessionRepo: SessionRepository, // Port, not implementation
+    private readonly gitService: GitService // Port, not implementation
   ) {}
 
   async execute(repoOwner: string, repoName: string): Promise<SessionId> {
@@ -166,6 +170,7 @@ export class CreateSession {
 ```
 
 **Example (Python):**
+
 ```python
 # application/ports/session_repository.py
 from abc import ABC, abstractmethod
@@ -208,44 +213,49 @@ class CreateSession:
 ### Infrastructure Layer (Adapters)
 
 **What it contains:**
+
 - Concrete implementations of port interfaces
 - Database adapters (PostgreSQL, SQLite, in-memory)
 - External API clients (GitHub, Anthropic)
 - HTTP framework setup (FastAPI, Express)
 - Configuration and dependency injection
 
-**Dependency rule:** Depends on application AND domain layers. Implements port interfaces defined in application layer.
+**Dependency rule:** Depends on application AND domain layers. Implements port interfaces defined in
+application layer.
 
 **Example (TypeScript):**
+
 ```typescript
 // infrastructure/persistence/SqliteSessionRepository.ts
-import { SessionRepository } from '../../application/ports/SessionRepository';
+import { SessionRepository } from "../../application/ports/SessionRepository";
 
 export class SqliteSessionRepository implements SessionRepository {
   constructor(private readonly db: Database) {}
 
   async save(session: Session): Promise<void> {
     const data = this.serialize(session);
-    await this.db.run(
-      'INSERT OR REPLACE INTO sessions (id, data) VALUES (?, ?)',
-      [session.id.value, JSON.stringify(data)]
-    );
+    await this.db.run("INSERT OR REPLACE INTO sessions (id, data) VALUES (?, ?)", [
+      session.id.value,
+      JSON.stringify(data),
+    ]);
   }
 
   async findById(id: SessionId): Promise<Session | null> {
-    const row = await this.db.get(
-      'SELECT data FROM sessions WHERE id = ?',
-      [id.value]
-    );
+    const row = await this.db.get("SELECT data FROM sessions WHERE id = ?", [id.value]);
     return row ? this.deserialize(row.data) : null;
   }
 
-  private serialize(session: Session): object { /* ... */ }
-  private deserialize(data: string): Session { /* ... */ }
+  private serialize(session: Session): object {
+    /* ... */
+  }
+  private deserialize(data: string): Session {
+    /* ... */
+  }
 }
 ```
 
 **Example (Python):**
+
 ```python
 # infrastructure/persistence/sqlite_session_repository.py
 from application.ports.session_repository import SessionRepository
@@ -293,6 +303,7 @@ Application Layer          Infrastructure Layer
 ```
 
 This allows:
+
 - **Testing**: Use fake in-memory adapter in tests
 - **Flexibility**: Swap PostgreSQL for MongoDB without touching application layer
 - **Isolation**: Business logic doesn't know about database details
@@ -302,22 +313,24 @@ This allows:
 Wire up concrete implementations at application startup:
 
 **TypeScript:**
+
 ```typescript
 // infrastructure/di/container.ts
 export function createContainer(): Container {
-  const db = new Database('./sessions.db');
+  const db = new Database("./sessions.db");
   const sessionRepo = new SqliteSessionRepository(db);
   const gitService = new GitServiceAdapter();
 
   return {
     createSession: new CreateSession(sessionRepo, gitService),
-    sendPrompt: new SendPrompt(sessionRepo, /* ... */),
+    sendPrompt: new SendPrompt(sessionRepo /* ... */),
     // ... other use cases
   };
 }
 ```
 
 **Python:**
+
 ```python
 # infrastructure/di/container.py
 def create_container() -> Container:
@@ -343,14 +356,16 @@ def create_container() -> Container:
 ## Common Mistakes
 
 ❌ **Domain importing from application/infrastructure**
+
 ```typescript
 // domain/Session.ts - WRONG!
-import { SessionRepository } from '../application/ports/SessionRepository';
+import { SessionRepository } from "../application/ports/SessionRepository";
 ```
 
 ✅ Domain should have ZERO imports from outer layers
 
 ❌ **Business logic in infrastructure**
+
 ```typescript
 // infrastructure/SqliteSessionRepository.ts - WRONG!
 async save(session: Session): Promise<void> {
@@ -364,6 +379,7 @@ async save(session: Session): Promise<void> {
 ✅ Business rules belong in domain/application layers
 
 ❌ **Use cases depending on concrete implementations**
+
 ```typescript
 // application/CreateSession.ts - WRONG!
 import { SqliteSessionRepository } from '../../infrastructure/persistence';

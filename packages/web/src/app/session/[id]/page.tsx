@@ -13,6 +13,7 @@ import { PreviewPanel, type SelectedElementInfo } from "@/components/preview-pan
 import { VSCodePanel } from "@/components/vscode-panel";
 import { formatModelNameLower } from "@/lib/format";
 import type { SandboxEvent } from "@/lib/tool-formatters";
+import { extractFilesChanged } from "@/lib/tool-formatters";
 
 // Tab types for the main content area
 type MainTab = "chat" | "preview" | "code";
@@ -358,6 +359,9 @@ function SessionContent({
 }) {
   const { isOpen, toggle } = useSidebarContext();
 
+  // Derive files changed from Read/Edit/Write tool calls for the right sidebar
+  const filesChanged = useMemo(() => extractFilesChanged(events as SandboxEvent[]), [events]);
+
   // Deduplicate and group events for rendering
   const groupedEvents = useMemo(() => {
     const filteredEvents: SandboxEvent[] = [];
@@ -511,6 +515,7 @@ function SessionContent({
           participants={participants}
           events={events}
           artifacts={artifacts}
+          filesChanged={filesChanged}
         />
       </main>
 

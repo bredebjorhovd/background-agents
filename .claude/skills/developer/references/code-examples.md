@@ -1,6 +1,7 @@
 # Code Examples
 
-Complete examples demonstrating hexagonal architecture, TDD, and immutability patterns in TypeScript and Python.
+Complete examples demonstrating hexagonal architecture, TDD, and immutability patterns in TypeScript
+and Python.
 
 ## TypeScript Examples
 
@@ -26,19 +27,14 @@ export class Session {
     return new Session(
       this.id,
       this.repoRef,
-      [...this.messages, message],  // New array
+      [...this.messages, message], // New array
       this.createdAt
     );
   }
 
   // ✅ Pure function - returns new Session
   withMessages(messages: Message[]): Session {
-    return new Session(
-      this.id,
-      this.repoRef,
-      messages,
-      this.createdAt
-    );
+    return new Session(this.id, this.repoRef, messages, this.createdAt);
   }
 
   createSnapshot(): Snapshot {
@@ -49,7 +45,7 @@ export class Session {
 // ❌ WRONG - Mutation
 class MutableSession {
   addMessage(message: Message): void {
-    this.messages.push(message);  // MUTATION!
+    this.messages.push(message); // MUTATION!
   }
 }
 ```
@@ -62,7 +58,7 @@ class MutableSession {
 export class SessionId {
   private constructor(public readonly value: string) {
     if (!value || value.trim().length === 0) {
-      throw new Error('SessionId cannot be empty');
+      throw new Error("SessionId cannot be empty");
     }
   }
 
@@ -91,7 +87,7 @@ export class RepoRef {
     public readonly name: string
   ) {
     if (!owner || !name) {
-      throw new Error('Owner and name are required');
+      throw new Error("Owner and name are required");
     }
   }
 
@@ -156,9 +152,7 @@ export class CreateSession {
     await this.gitService.clone(repoRef);
 
     // Publish event via event publisher port
-    await this.eventPublisher.publish(
-      SessionCreatedEvent.create(sessionId, repoRef)
-    );
+    await this.eventPublisher.publish(SessionCreatedEvent.create(sessionId, repoRef));
 
     return sessionId;
   }
@@ -180,27 +174,17 @@ export class SendPrompt {
     }
 
     // Create user message
-    const userMessage = Message.create(
-      MessageId.generate(),
-      content,
-      'user'
-    );
+    const userMessage = Message.create(MessageId.generate(), content, "user");
 
     // Add to session (immutable update)
     const sessionWithUserMsg = session.addMessage(userMessage);
     await this.sessionRepo.save(sessionWithUserMsg);
 
     // Get AI response
-    const aiResponse = await this.aiService.generate(
-      sessionWithUserMsg.messages
-    );
+    const aiResponse = await this.aiService.generate(sessionWithUserMsg.messages);
 
     // Create assistant message
-    const assistantMessage = Message.create(
-      MessageId.generate(),
-      aiResponse,
-      'assistant'
-    );
+    const assistantMessage = Message.create(MessageId.generate(), aiResponse, "assistant");
 
     // Add to session (immutable update)
     const finalSession = sessionWithUserMsg.addMessage(assistantMessage);
@@ -256,14 +240,14 @@ export class InMemorySessionRepository implements SessionRepository {
 ```typescript
 // application/usecases/CreateSession.test.ts
 
-import { CreateSession } from './CreateSession';
-import { InMemorySessionRepository } from '../../tests/fakes/InMemorySessionRepository';
-import { FakeGitService } from '../../tests/fakes/FakeGitService';
-import { InMemoryEventPublisher } from '../../tests/fakes/InMemoryEventPublisher';
-import { SessionId } from '../../domain/value-objects/SessionId';
-import { RepoRef } from '../../domain/value-objects/RepoRef';
+import { CreateSession } from "./CreateSession";
+import { InMemorySessionRepository } from "../../tests/fakes/InMemorySessionRepository";
+import { FakeGitService } from "../../tests/fakes/FakeGitService";
+import { InMemoryEventPublisher } from "../../tests/fakes/InMemoryEventPublisher";
+import { SessionId } from "../../domain/value-objects/SessionId";
+import { RepoRef } from "../../domain/value-objects/RepoRef";
 
-describe('CreateSession', () => {
+describe("CreateSession", () => {
   let sessionRepo: InMemorySessionRepository;
   let gitService: FakeGitService;
   let eventPublisher: InMemoryEventPublisher;
@@ -276,39 +260,37 @@ describe('CreateSession', () => {
     useCase = new CreateSession(sessionRepo, gitService, eventPublisher);
   });
 
-  describe('execute', () => {
-    it('should create and persist new session', async () => {
-      const sessionId = await useCase.execute('octocat', 'hello-world');
+  describe("execute", () => {
+    it("should create and persist new session", async () => {
+      const sessionId = await useCase.execute("octocat", "hello-world");
 
       const saved = await sessionRepo.findById(sessionId);
       expect(saved).not.toBeNull();
-      expect(saved!.repoRef.owner).toBe('octocat');
-      expect(saved!.repoRef.name).toBe('hello-world');
+      expect(saved!.repoRef.owner).toBe("octocat");
+      expect(saved!.repoRef.name).toBe("hello-world");
       expect(saved!.messages).toHaveLength(0);
     });
 
-    it('should clone repository', async () => {
-      await useCase.execute('octocat', 'hello-world');
+    it("should clone repository", async () => {
+      await useCase.execute("octocat", "hello-world");
 
       expect(gitService.clonedRepos).toHaveLength(1);
       expect(gitService.clonedRepos[0]).toEqual({
-        owner: 'octocat',
-        name: 'hello-world'
+        owner: "octocat",
+        name: "hello-world",
       });
     });
 
-    it('should publish SessionCreated event', async () => {
-      const sessionId = await useCase.execute('octocat', 'hello-world');
+    it("should publish SessionCreated event", async () => {
+      const sessionId = await useCase.execute("octocat", "hello-world");
 
       expect(eventPublisher.events).toHaveLength(1);
-      expect(eventPublisher.events[0].type).toBe('SessionCreated');
+      expect(eventPublisher.events[0].type).toBe("SessionCreated");
       expect(eventPublisher.events[0].sessionId).toEqual(sessionId);
     });
 
-    it('should throw error when repository name is empty', async () => {
-      await expect(
-        useCase.execute('octocat', '')
-      ).rejects.toThrow('Owner and name are required');
+    it("should throw error when repository name is empty", async () => {
+      await expect(useCase.execute("octocat", "")).rejects.toThrow("Owner and name are required");
     });
   });
 });
@@ -319,12 +301,12 @@ describe('CreateSession', () => {
 ```typescript
 // infrastructure/persistence/SqliteSessionRepository.ts
 
-import { SessionRepository } from '../../application/ports/SessionRepository';
-import { Session } from '../../domain/entities/Session';
-import { SessionId } from '../../domain/value-objects/SessionId';
-import { RepoRef } from '../../domain/value-objects/RepoRef';
-import { Message } from '../../domain/entities/Message';
-import { Database } from 'better-sqlite3';
+import { SessionRepository } from "../../application/ports/SessionRepository";
+import { Session } from "../../domain/entities/Session";
+import { SessionId } from "../../domain/value-objects/SessionId";
+import { RepoRef } from "../../domain/value-objects/RepoRef";
+import { Message } from "../../domain/entities/Message";
+import { Database } from "better-sqlite3";
 
 export class SqliteSessionRepository implements SessionRepository {
   constructor(private readonly db: Database) {}
@@ -332,38 +314,54 @@ export class SqliteSessionRepository implements SessionRepository {
   async save(session: Session): Promise<void> {
     const data = this.serialize(session);
 
-    this.db.prepare(`
+    this.db
+      .prepare(
+        `
       INSERT OR REPLACE INTO sessions (id, repo_owner, repo_name, data, created_at)
       VALUES (?, ?, ?, ?, ?)
-    `).run(
-      session.id.value,
-      session.repoRef.owner,
-      session.repoRef.name,
-      JSON.stringify(data),
-      session.createdAt.toISOString()
-    );
+    `
+      )
+      .run(
+        session.id.value,
+        session.repoRef.owner,
+        session.repoRef.name,
+        JSON.stringify(data),
+        session.createdAt.toISOString()
+      );
   }
 
   async findById(id: SessionId): Promise<Session | null> {
-    const row = this.db.prepare(`
+    const row = this.db
+      .prepare(
+        `
       SELECT data FROM sessions WHERE id = ?
-    `).get(id.value) as { data: string } | undefined;
+    `
+      )
+      .get(id.value) as { data: string } | undefined;
 
     return row ? this.deserialize(row.data) : null;
   }
 
   async findAll(): Promise<Session[]> {
-    const rows = this.db.prepare(`
+    const rows = this.db
+      .prepare(
+        `
       SELECT data FROM sessions ORDER BY created_at DESC
-    `).all() as { data: string }[];
+    `
+      )
+      .all() as { data: string }[];
 
-    return rows.map(row => this.deserialize(row.data));
+    return rows.map((row) => this.deserialize(row.data));
   }
 
   async delete(id: SessionId): Promise<void> {
-    this.db.prepare(`
+    this.db
+      .prepare(
+        `
       DELETE FROM sessions WHERE id = ?
-    `).run(id.value);
+    `
+      )
+      .run(id.value);
   }
 
   private serialize(session: Session): object {
@@ -371,14 +369,14 @@ export class SqliteSessionRepository implements SessionRepository {
       id: session.id.value,
       repoRef: {
         owner: session.repoRef.owner,
-        name: session.repoRef.name
+        name: session.repoRef.name,
       },
-      messages: session.messages.map(m => ({
+      messages: session.messages.map((m) => ({
         id: m.id.value,
         content: m.content,
-        role: m.role
+        role: m.role,
       })),
-      createdAt: session.createdAt.toISOString()
+      createdAt: session.createdAt.toISOString(),
     };
   }
 
@@ -870,4 +868,5 @@ class SqliteSessionRepository(SessionRepository):
 4. **Fakes for testing** - Use real implementations with shortcuts, not mocks
 5. **TDD** - Write tests first, implement minimum code, refactor
 
-These patterns apply equally to TypeScript and Python. The core principles remain the same across languages.
+These patterns apply equally to TypeScript and Python. The core principles remain the same across
+languages.

@@ -1,3 +1,5 @@
+import type { FileChange } from "@/types/session";
+
 export interface SandboxEvent {
   type: string;
   content?: string;
@@ -11,6 +13,45 @@ export interface SandboxEvent {
   output?: string;
   sha?: string;
   timestamp: number;
+}
+
+/** Tool names that reference a file path in args (lowercase for case-insensitive match) */
+const FILE_TOOL_NAMES = new Set(["read", "edit", "write", "read_file", "edit_file", "write_file"]);
+
+function countLines(s: string | undefined): number {
+  if (s == null || typeof s !== "string") return 0;
+  return s.split(/\r?\n/).length;
+}
+
+/**
+ * Extract unique file paths from Read/Edit/Write tool_call events for the right sidebar.
+ * Uses args.filePath or args.file_path (OpenCode may send either).
+ * Matches tool name case-insensitively (OpenCode may send "read" or "Read").
+ * For Edit events, computes additions/deletions from oldString/newString line counts.
+ */
+export function extractFilesChanged(events: SandboxEvent[]): FileChange[] {
+  const byPath = new Map<string, { additions: number; deletions: number }>();
+  for (const event of events) {
+    if (event.type !== "tool_call" || !event.tool) continue;
+    const toolLower = (event.tool as string).toLowerCase();
+    if (!FILE_TOOL_NAMES.has(toolLower)) continue;
+    const path =
+      (event.args?.filePath as string | undefined) ?? (event.args?.file_path as string | undefined);
+    if (!path) continue;
+    const existing = byPath.get(path) ?? { additions: 0, deletions: 0 };
+    if (toolLower === "edit" || toolLower === "edit_file") {
+      const oldStr = (event.args?.oldString ?? event.args?.old_string) as string | undefined;
+      const newStr = (event.args?.newString ?? event.args?.new_string) as string | undefined;
+      existing.deletions += countLines(oldStr);
+      existing.additions += countLines(newStr);
+    }
+    byPath.set(path, existing);
+  }
+  return Array.from(byPath.entries(), ([filename, { additions, deletions }]) => ({
+    filename,
+    additions,
+    deletions,
+  }));
 }
 
 /**
@@ -29,14 +70,6 @@ function truncate(str: string | undefined, maxLen: number): string {
   if (!str) return "";
   if (str.length <= maxLen) return str;
   return str.slice(0, maxLen) + "...";
-}
-
-/**
- * Count lines in a string
- */
-function countLines(str: string | undefined): number {
-  if (!str) return 0;
-  return str.split("\n").length;
 }
 
 export interface FormattedToolCall {
@@ -200,7 +233,7 @@ export function formatToolGroup(events: SandboxEvent[]): {
   switch (toolName) {
     case "Read": {
       const _files = events
-        .map((e) => basename(e.args?.file_path as string | undefined))
+        .map((e) => basename((e.args?.filePath ?? e.args?.file_path) as string | undefined))
         .filter(Boolean);
       return {
         toolName: "Read",

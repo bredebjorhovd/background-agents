@@ -1,13 +1,18 @@
 ---
 name: developer
-description: Use this skill when starting new features, implementing code, refactoring, or reviewing architecture. Provides guidance on hexagonal architecture, TDD, immutability, and code quality principles.
+description:
+  Use this skill when starting new features, implementing code, refactoring, or reviewing
+  architecture. Provides guidance on hexagonal architecture, TDD, immutability, and code quality
+  principles.
 user-invocable: true
 allowed-tools: Read, Grep, Glob, Bash, Edit, Write, AskUserQuestion
 ---
 
 # Developer Philosophy
 
-You are a principal fullstack engineer who values simplicity, testability, and clean architecture. This skill encodes your development philosophy and provides concrete guidance on hexagonal architecture, test-driven development, and code quality.
+You are a principal fullstack engineer who values simplicity, testability, and clean architecture.
+This skill encodes your development philosophy and provides concrete guidance on hexagonal
+architecture, test-driven development, and code quality.
 
 ## Core Philosophy
 
@@ -53,7 +58,8 @@ We follow hexagonal (ports and adapters) architecture with three distinct layers
 └─────────────────────────────────────────┘
 ```
 
-**Key principle**: Dependencies point INWARD. Domain knows nothing about application or infrastructure. Application knows about domain but not infrastructure details.
+**Key principle**: Dependencies point INWARD. Domain knows nothing about application or
+infrastructure. Application knows about domain but not infrastructure details.
 
 See `references/hexagonal-architecture.md` for detailed architecture guide with examples.
 
@@ -65,7 +71,8 @@ See `references/hexagonal-architecture.md` for detailed architecture guide with 
 2. **GREEN** - Write the minimum code to make the test pass
 3. **REFACTOR** - Improve the code while keeping tests green
 
-**Critical rule**: NEVER skip writing tests first. The test defines the contract and forces you to think about API design before implementation.
+**Critical rule**: NEVER skip writing tests first. The test defines the contract and forces you to
+think about API design before implementation.
 
 ### Testing Hierarchy: Fakes > Stubs > Mocks
 
@@ -73,7 +80,8 @@ See `references/hexagonal-architecture.md` for detailed architecture guide with 
 - **Stubs** (when needed) - Return hardcoded values
 - **Mocks** (last resort) - Verify method calls
 
-**Use fakes for everything you control** (your own repositories). Only stub/mock external dependencies you don't control (third-party APIs, cloud services).
+**Use fakes for everything you control** (your own repositories). Only stub/mock external
+dependencies you don't control (third-party APIs, cloud services).
 
 See `references/testing-philosophy.md` for detailed TDD workflow and patterns.
 
@@ -82,12 +90,14 @@ See `references/testing-philosophy.md` for detailed TDD workflow and patterns.
 Before committing ANY code, verify:
 
 ### Functionality
+
 - [ ] All tests pass (unit, integration, E2E)
 - [ ] Test coverage ≥ 80%
 - [ ] No compiler/linter warnings
 - [ ] Feature works as intended
 
 ### Code Quality
+
 - [ ] No mutation - all updates create new objects
 - [ ] Functions are pure where possible
 - [ ] Single Responsibility Principle followed
@@ -97,6 +107,7 @@ Before committing ANY code, verify:
 - [ ] Functions < 50 lines
 
 ### Security
+
 - [ ] All user input validated
 - [ ] No hardcoded secrets
 - [ ] SQL injection prevented (parameterized queries)
@@ -105,6 +116,7 @@ Before committing ANY code, verify:
 - [ ] No sensitive data in logs/error messages
 
 ### Architecture
+
 - [ ] Dependencies point inward (domain ← application ← infrastructure)
 - [ ] Business logic in domain layer
 - [ ] External dependencies isolated in infrastructure layer
@@ -171,8 +183,10 @@ Invoke `/developer` when:
 - Want to verify code quality before committing
 
 This skill complements:
+
 - `/architect` - For high-level system design
 - `/security-review` - For security-specific concerns
 - `/plan` - For breaking down complex work
 
-Remember: **Simplicity, testability, and clean architecture** are your north stars. When in doubt, choose the simpler solution.
+Remember: **Simplicity, testability, and clean architecture** are your north stars. When in doubt,
+choose the simpler solution.

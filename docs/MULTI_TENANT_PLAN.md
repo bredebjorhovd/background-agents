@@ -153,29 +153,36 @@ After implementation, verify:
 
 ### User Decisions
 
-| Question | Decision |
-|----------|----------|
-| OAuth token management | **Refresh token rotation** - store refresh tokens, auto-refresh access tokens |
-| Existing sessions on migration | **Invalidate old sessions** - clean break for security |
-| Background tasks (scheduler) | **Keep global app token** - scheduler uses broad installation token |
-| Token storage in Durable Objects | **Don't store tokens in DO** - fetch fresh from web app on each WS reconnect |
+| Question                         | Decision                                                                      |
+| -------------------------------- | ----------------------------------------------------------------------------- |
+| OAuth token management           | **Refresh token rotation** - store refresh tokens, auto-refresh access tokens |
+| Existing sessions on migration   | **Invalidate old sessions** - clean break for security                        |
+| Background tasks (scheduler)     | **Keep global app token** - scheduler uses broad installation token           |
+| Token storage in Durable Objects | **Don't store tokens in DO** - fetch fresh from web app on each WS reconnect  |
 
 ### Critical Gaps Identified
 
 #### 1. GitHub OAuth Refresh Tokens
-**Problem:** Standard GitHub OAuth only provides access tokens (8-hour expiry). Refresh tokens require enabling "Expire user authorization tokens" in GitHub App settings.
+
+**Problem:** Standard GitHub OAuth only provides access tokens (8-hour expiry). Refresh tokens
+require enabling "Expire user authorization tokens" in GitHub App settings.
 
 **Action Required:**
+
 - Verify if setting is enabled (see `docs/GITHUB_APP_VERIFICATION.md`)
 - If not enabled: Enable it and update NextAuth config
 - Add token refresh logic to `packages/web/src/lib/auth.ts`
 
-**Reference:** https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens
+**Reference:**
+https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens
 
 #### 2. Token Refresh Infrastructure
-**Current state:** `packages/web/src/lib/auth.ts` stores `accessToken` and `accessTokenExpiresAt` but has no refresh logic.
+
+**Current state:** `packages/web/src/lib/auth.ts` stores `accessToken` and `accessTokenExpiresAt`
+but has no refresh logic.
 
 **Required implementation:**
+
 ```typescript
 // In jwt callback
 if (Date.now() > token.accessTokenExpiresAt - 60000) {
@@ -186,28 +193,35 @@ if (Date.now() > token.accessTokenExpiresAt - 60000) {
 ```
 
 #### 3. Session Invalidation Migration
+
 **Problem:** Plan says invalidate old sessions but doesn't specify how.
 
 **Required:**
+
 - Schema migration to add `installation_id` column (NOT NULL)
 - Migration script to close all existing sessions
 - KV cleanup for session index entries
 
 #### 4. Installation ID Validation
-**Problem:** Plan says "Verify the user has access to this installationId" but doesn't specify mechanism.
+
+**Problem:** Plan says "Verify the user has access to this installationId" but doesn't specify
+mechanism.
 
 **Implementation:**
+
 ```typescript
 // In handleCreateSession
 const userInstallations = await listUserInstallations(userToken);
-const hasAccess = userInstallations.some(i => i.id === body.installationId);
+const hasAccess = userInstallations.some((i) => i.id === body.installationId);
 if (!hasAccess) {
   return new Response("Unauthorized installation", { status: 403 });
 }
 ```
 
 #### 5. Scoped Token Permissions
+
 **GitHub API for scoped tokens:**
+
 ```
 POST /app/installations/{installation_id}/access_tokens
 {
@@ -217,19 +231,24 @@ POST /app/installations/{installation_id}/access_tokens
 ```
 
 **Recommended permissions:**
+
 - `contents: write` - for git push
 - `pull_requests: write` - for PR creation
 - `metadata: read` - required baseline
 
 #### 6. Error Handling for Installation Removal
+
 **Problem:** What if GitHub App is uninstalled while sessions are active?
 
-**Recommendation:** Add periodic installation validation or handle 404/401 errors gracefully with user-facing message "Repository access revoked."
+**Recommendation:** Add periodic installation validation or handle 404/401 errors gracefully with
+user-facing message "Repository access revoked."
 
 #### 7. Rate Limiting Concerns
+
 **Problem:** Per-user API calls to GitHub could hit rate limits (5000/hour per user token).
 
 **Mitigations:**
+
 - Short-lived per-user cache (5 min TTL) for repo lists
 - Batch installation queries where possible
 
@@ -289,21 +308,22 @@ Before starting implementation:
 
 ### Files to Modify
 
-| File | Changes |
-|------|---------|
-| `packages/shared/src/types.ts` | Add `installationId` to Session, SessionState, CreateSessionRequest; add GitHubInstallation type |
-| `packages/control-plane/src/session/schema.ts` | Add `installation_id` column (NOT NULL); migration to close old sessions |
-| `packages/control-plane/src/auth/github.ts` | Add `listUserInstallations`, `listUserRepositories` (using user token) |
-| `packages/control-plane/src/router.ts` | Update `handleListRepos` (user token), `handleCreateSession` (validation) |
-| `packages/web/src/lib/auth.ts` | Add `refreshAccessToken`, store refresh_token in JWT, auto-refresh logic |
-| `packages/web/src/app/api/repos/route.ts` | Pass user token to control plane via Authorization header |
-| `packages/web/src/app/api/sessions/route.ts` | Include `installationId` in request to control plane |
-| `packages/modal-infra/src/auth/github_app.py` | Support scoped tokens with `repositories` param and permissions |
-| `packages/modal-infra/src/web_api.py` | Accept `installation_id`, generate scoped token, validate HMAC |
+| File                                           | Changes                                                                                          |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `packages/shared/src/types.ts`                 | Add `installationId` to Session, SessionState, CreateSessionRequest; add GitHubInstallation type |
+| `packages/control-plane/src/session/schema.ts` | Add `installation_id` column (NOT NULL); migration to close old sessions                         |
+| `packages/control-plane/src/auth/github.ts`    | Add `listUserInstallations`, `listUserRepositories` (using user token)                           |
+| `packages/control-plane/src/router.ts`         | Update `handleListRepos` (user token), `handleCreateSession` (validation)                        |
+| `packages/web/src/lib/auth.ts`                 | Add `refreshAccessToken`, store refresh_token in JWT, auto-refresh logic                         |
+| `packages/web/src/app/api/repos/route.ts`      | Pass user token to control plane via Authorization header                                        |
+| `packages/web/src/app/api/sessions/route.ts`   | Include `installationId` in request to control plane                                             |
+| `packages/modal-infra/src/auth/github_app.py`  | Support scoped tokens with `repositories` param and permissions                                  |
+| `packages/modal-infra/src/web_api.py`          | Accept `installation_id`, generate scoped token, validate HMAC                                   |
 
 ### Testing Strategy
 
 #### Automated Tests
+
 1. **Unit tests:**
    - `listUserInstallations` returns correct installations
    - `listUserRepositories` filters by user access
@@ -317,6 +337,7 @@ Before starting implementation:
    - Token refresh flow works correctly
 
 #### Manual Verification
+
 - Login as User A, verify cannot see User B's repos
 - In sandbox, attempt `git clone` of different repo (must fail)
 - Verify `installationId` stored in SQLite
@@ -324,7 +345,8 @@ Before starting implementation:
 
 ### Open Questions
 
-1. **Multi-installation repos:** If a repo appears in multiple installations, how should UI handle it?
+1. **Multi-installation repos:** If a repo appears in multiple installations, how should UI handle
+   it?
    - **Decision:** Let user choose installation when creating session
 
 2. **Token expiration setting:** Need to verify current GitHub App configuration
