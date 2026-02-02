@@ -10,7 +10,8 @@ interface MessageQueueDependencies {
   messageRepo: MessageRepository;
   participantRepo: ParticipantRepository;
   getSession: () => { model?: string } | null;
-  sendToSandbox: (command: PromptCommand) => Promise<void>;
+  /** Returns true if the command was sent to the sandbox, false if sandbox not connected. */
+  sendToSandbox: (command: PromptCommand) => Promise<boolean>;
   spawnIfNeeded: () => Promise<void>;
 }
 
@@ -63,13 +64,8 @@ export function createMessageQueue(deps: MessageQueueDependencies): MessageQueue
           return;
         }
 
-        // Spawn sandbox if needed (before marking as processing)
+        // Spawn sandbox if needed (before sending)
         await spawnIfNeeded();
-
-        // Update message status to processing
-        messageRepo.updateStatus(nextMessage.id, "processing", {
-          startedAt: Date.now(),
-        });
 
         // Get author information
         const author = participantRepo.getById(nextMessage.author_id);
@@ -91,8 +87,13 @@ export function createMessageQueue(deps: MessageQueueDependencies): MessageQueue
           attachments: nextMessage.attachments ? JSON.parse(nextMessage.attachments) : undefined,
         };
 
-        // Send command to sandbox
-        await sendToSandbox(command);
+        // Send command to sandbox; only mark as processing if actually sent (sandbox connected)
+        const sent = await sendToSandbox(command);
+        if (sent) {
+          messageRepo.updateStatus(nextMessage.id, "processing", {
+            startedAt: Date.now(),
+          });
+        }
       } catch (error) {
         console.error("Failed to process message queue:", error);
       }

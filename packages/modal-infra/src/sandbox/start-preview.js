@@ -350,14 +350,16 @@ async function getPreviewUrl(sessionId, port) {
 
 export default tool({
   name: "start-preview",
-  description: `Smart preview tool that automatically:
+  description: `Use this tool when the user says "start the dev server", "start the preview", "start the dev server and start the preview", or similar. Do NOT use run_command with "npm run dev" - that blocks until timeout and locks the session.
+
+This tool automatically:
 1. Detects your project type (Vite, Next.js, CRA, Angular, Vue, Svelte, Astro)
 2. Installs dependencies if needed (npm/pnpm/yarn/bun)
 3. Configures the framework for external access (allowedHosts, etc.)
-4. Starts the dev server with the correct flags
+4. Starts the dev server in the background with the correct flags
 5. Returns the live preview URL
 
-Just call this tool and it handles everything - no need to manually configure anything.`,
+Just call this tool and it handles everything - no need to manually configure or run npm run dev.`,
   args: {
     skipInstall: z
       .boolean()

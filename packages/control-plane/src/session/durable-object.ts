@@ -301,7 +301,7 @@ export class SessionDO extends DurableObject<Env> {
       participantRepo: this.participantRepo,
       getSession: () => this.getSession(),
       sendToSandbox: async (command) => {
-        await this.sendCommandToSandbox(command);
+        return this.sendCommandToSandbox(command);
       },
       spawnIfNeeded: async () => {
         await this.spawnSandboxIfNeeded();
@@ -1353,10 +1353,12 @@ export class SessionDO extends DurableObject<Env> {
     // Check persisted status and last spawn time to prevent duplicate spawns
     const sandbox = this.sandboxRepo.get();
     const currentStatus = sandbox?.status;
-    const lastSpawnTime = sandbox?.created_at || 0;
+    // Only use created_at for cooldown if we have ever spawned (modal_sandbox_id set);
+    // otherwise created_at is session creation time and would block first spawn for 30s
+    const lastSpawnTime = sandbox?.modal_sandbox_id != null ? (sandbox?.created_at ?? 0) : 0;
     const snapshotImageId = sandbox?.snapshot_image_id;
     const now = Date.now();
-    const timeSinceLastSpawn = now - lastSpawnTime;
+    const timeSinceLastSpawn = lastSpawnTime > 0 ? now - lastSpawnTime : Number.POSITIVE_INFINITY;
 
     // Check circuit breaker
     if (!this.sandboxManager!.canSpawnSandbox()) {
@@ -2952,20 +2954,24 @@ export class SessionDO extends DurableObject<Env> {
   /**
    * Send command to sandbox WebSocket.
    * Called by MessageQueue when processing a message.
+   * @returns true if the command was sent (sandbox connected), false otherwise.
    */
-  private async sendCommandToSandbox(command: PromptCommand): Promise<void> {
+  private async sendCommandToSandbox(command: PromptCommand): Promise<boolean> {
     this.initServices();
 
-    // Broadcast processing status change
-    this.broadcast({ type: "processing_status", isProcessing: true });
+    const sandboxWs = this.wsManager!.getSandboxWebSocket();
+    if (!sandboxWs) {
+      return false;
+    }
 
     // Reset activity timer - user is actively using the sandbox
     this.sandboxManager!.updateActivity();
 
-    const sandboxWs = this.wsManager!.getSandboxWebSocket();
-    if (sandboxWs) {
-      this.wsManager!.safeSend(sandboxWs, command);
-    }
+    // Broadcast processing status only after we know we're sending
+    this.broadcast({ type: "processing_status", isProcessing: true });
+
+    this.wsManager!.safeSend(sandboxWs, command);
+    return true;
   }
 
   /**

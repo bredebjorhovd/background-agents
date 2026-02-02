@@ -11,6 +11,7 @@ This module handles:
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import secrets
@@ -26,6 +27,70 @@ import websockets
 from websockets import ClientConnection, State
 
 from .sandbox_types import GitUser
+
+# Injected into the page for element-at-point - runs in browser context. Same logic as get_element_at_point.py.
+GET_ELEMENT_AT_POINT_SCRIPT = """
+([x, y]) => {
+  const el = document.elementFromPoint(x, y);
+  if (!el) return null;
+
+  function generateSelector(element) {
+    if (element.id) return '#' + element.id;
+    const path = [];
+    let current = element;
+    while (current && current !== document.body) {
+      let sel = current.tagName.toLowerCase();
+      if (current.className && typeof current.className === 'string') {
+        const classes = current.className.trim().split(/\\s+/).filter(c => c && !c.startsWith('_'));
+        if (classes.length > 0) sel += '.' + classes.slice(0, 2).join('.');
+      }
+      const siblings = current.parentElement?.children;
+      if (siblings && siblings.length > 1) {
+        const same = Array.from(siblings).filter(s => s.tagName === current.tagName);
+        if (same.length > 1) sel += ':nth-of-type(' + (same.indexOf(current) + 1) + ')';
+      }
+      path.unshift(sel);
+      current = current.parentElement;
+      if (path.length >= 3) break;
+    }
+    return path.join(' > ');
+  }
+
+  function getReactInfo(element) {
+    const key = Object.keys(element).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+    if (!key) return null;
+    try {
+      let node = element[key];
+      while (node) {
+        if (node.type && typeof node.type === 'function') {
+          const name = node.type.displayName || node.type.name || 'Unknown';
+          const props = node.memoizedProps || {};
+          const clean = {};
+          for (const [k, v] of Object.entries(props)) {
+            if (k === 'children' || typeof v === 'function' || (typeof v === 'object' && v !== null)) continue;
+            clean[k] = v;
+          }
+          return { name, props: clean };
+        }
+        if (node.type && typeof node.type === 'string') { node = node.return; continue; }
+        node = node.return;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  const selector = generateSelector(el);
+  const react = getReactInfo(el);
+  const rect = el.getBoundingClientRect();
+  return {
+    selector,
+    tagName: el.tagName.toLowerCase(),
+    text: el.innerText ? el.innerText.slice(0, 200) : null,
+    react: react || undefined,
+    boundingRect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+  };
+}
+"""
 
 
 class TokenResolution(NamedTuple):
@@ -143,6 +208,18 @@ class AgentBridge:
 
         # HTTP client for OpenCode API
         self.http_client: httpx.AsyncClient | None = None
+
+        # Long-lived Playwright page for element-at-point (avoids subprocess per request)
+        self._element_at_point_lock = asyncio.Lock()
+        self._element_playwright_cm: Any = None
+        self._element_browser: Any = None
+        self._element_context: Any = None
+        self._element_page: Any = None
+        self._element_page_url: str | None = None
+        self._element_page_viewport: tuple[int, int] | None = None
+
+        # Message ID of the prompt currently being processed (for stop → execution_complete)
+        self._current_prompt_message_id: str | None = None
 
     @property
     def ws_url(self) -> str:
@@ -336,20 +413,21 @@ class AgentBridge:
 
         print(f"[bridge] Processing prompt {message_id} with model {model}, author={author_data}")
 
-        github_name = author_data.get("githubName")
-        github_email = author_data.get("githubEmail")
-        if github_name and github_email:
-            await self._configure_git_identity(
-                GitUser(
-                    name=github_name,
-                    email=github_email,
-                )
-            )
-
-        if not self.opencode_session_id:
-            await self._create_opencode_session()
-
+        self._current_prompt_message_id = message_id
         try:
+            github_name = author_data.get("githubName")
+            github_email = author_data.get("githubEmail")
+            if github_name and github_email:
+                await self._configure_git_identity(
+                    GitUser(
+                        name=github_name,
+                        email=github_email,
+                    )
+                )
+
+            if not self.opencode_session_id:
+                await self._create_opencode_session()
+
             async for event in self._stream_opencode_response_sse(message_id, content, model):
                 await self._send_event(event)
 
@@ -371,6 +449,8 @@ class AgentBridge:
                     "error": str(e),
                 }
             )
+        finally:
+            self._current_prompt_message_id = None
 
     async def _create_opencode_session(self) -> None:
         """Create a new OpenCode session."""
@@ -584,7 +664,6 @@ class AgentBridge:
 
         max_wait_time = 600.0  # Increased from 300s to support longer-running agents
         start_time = time.time()
-        last_token_time = time.time()  # Track when we last received a token
 
         try:
             async with asyncio.timeout(max_wait_time):
@@ -624,8 +703,6 @@ class AgentBridge:
                             continue
 
                         if event_type == "server.heartbeat":
-                            # Reset last_token_time on heartbeat to keep control plane alive
-                            last_token_time = time.time()
                             continue
 
                         event_session_id = props.get("sessionID") or props.get("part", {}).get(
@@ -673,14 +750,18 @@ class AgentBridge:
                                             else:
                                                 cumulative_text[part_id] = text
                                             if cumulative_text.get(part_id):
-                                                last_token_time = time.time()
                                                 # Send heartbeat to control plane every 30s to prevent timeout
                                                 elapsed_since_heartbeat = time.time() - start_time
-                                                if elapsed_since_heartbeat > 30 and elapsed_since_heartbeat % 30 < 0.5:
-                                                    await self._send_event({
-                                                        "type": "sse_heartbeat",
-                                                        "messageId": message_id,
-                                                    })
+                                                if (
+                                                    elapsed_since_heartbeat > 30
+                                                    and elapsed_since_heartbeat % 30 < 0.5
+                                                ):
+                                                    await self._send_event(
+                                                        {
+                                                            "type": "sse_heartbeat",
+                                                            "messageId": message_id,
+                                                        }
+                                                    )
                                                 yield {
                                                     "type": "token",
                                                     "content": cumulative_text[part_id],
@@ -751,14 +832,18 @@ class AgentBridge:
                                     cumulative_text[part_id] = text
 
                                 if cumulative_text.get(part_id):
-                                    last_token_time = time.time()
                                     # Send heartbeat to control plane every 30s to prevent timeout
                                     elapsed_since_heartbeat = time.time() - start_time
-                                    if elapsed_since_heartbeat > 30 and elapsed_since_heartbeat % 30 < 0.5:
-                                        await self._send_event({
-                                            "type": "sse_heartbeat",
-                                            "messageId": message_id,
-                                        })
+                                    if (
+                                        elapsed_since_heartbeat > 30
+                                        and elapsed_since_heartbeat % 30 < 0.5
+                                    ):
+                                        await self._send_event(
+                                            {
+                                                "type": "sse_heartbeat",
+                                                "messageId": message_id,
+                                            }
+                                        )
                                     yield {
                                         "type": "token",
                                         "content": cumulative_text[part_id],
@@ -855,7 +940,9 @@ class AgentBridge:
 
         except TimeoutError:
             elapsed = time.time() - start_time
-            print(f"[bridge] SSE stream timed out after {elapsed:.1f}s, attempting polling fallback...")
+            print(
+                f"[bridge] SSE stream timed out after {elapsed:.1f}s, attempting polling fallback..."
+            )
             # Try polling fallback to recover remaining events
             async for final_event in self._fetch_final_message_state(
                 message_id,
@@ -966,18 +1053,29 @@ class AgentBridge:
             print(f"[bridge] Error fetching final state: {e}")
 
     async def _handle_stop(self) -> None:
-        """Handle stop command - halt current execution."""
+        """Handle stop command - halt current execution and clear processing state."""
         print("[bridge] Stopping current execution")
 
-        if not self.http_client or not self.opencode_session_id:
-            return
+        if self.http_client and self.opencode_session_id:
+            try:
+                await self.http_client.post(
+                    f"{self.opencode_base_url}/session/{self.opencode_session_id}/stop",
+                )
+            except Exception as e:
+                print(f"[bridge] Error stopping execution: {e}")
 
-        try:
-            await self.http_client.post(
-                f"{self.opencode_base_url}/session/{self.opencode_session_id}/stop",
+        # Always send execution_complete so the control plane clears processing and the UI unlocks
+        current_id = self._current_prompt_message_id
+        if current_id:
+            await self._send_event(
+                {
+                    "type": "execution_complete",
+                    "messageId": current_id,
+                    "success": False,
+                    "error": "Stopped by user",
+                }
             )
-        except Exception as e:
-            print(f"[bridge] Error stopping execution: {e}")
+            self._current_prompt_message_id = None
 
     async def _handle_snapshot(self) -> None:
         """Handle snapshot command - prepare for snapshot."""
@@ -1097,8 +1195,60 @@ class AgentBridge:
                 }
             )
 
+    async def _ensure_element_at_point_page(
+        self, url: str, viewport_width: int, viewport_height: int
+    ) -> Any:
+        """Ensure we have a Playwright page for the preview URL and viewport. Reuses a long-lived page."""
+        if viewport_width <= 0 or viewport_height <= 0:
+            viewport_width = 1280
+            viewport_height = 720
+        target_viewport = (viewport_width, viewport_height)
+
+        if (
+            self._element_page is not None
+            and self._element_page_url == url
+            and self._element_page_viewport == target_viewport
+        ):
+            return self._element_page
+
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            raise RuntimeError("playwright not installed")
+
+        if self._element_playwright_cm is None:
+            self._element_playwright_cm = async_playwright()
+            self._element_playwright = await self._element_playwright_cm.__aenter__()
+            self._element_browser = await self._element_playwright.chromium.launch(headless=True)
+
+        if self._element_page is None or self._element_page_url != url:
+            if self._element_page is not None:
+                with contextlib.suppress(Exception):
+                    await self._element_page.close()
+                self._element_page = None
+            if self._element_context is not None:
+                with contextlib.suppress(Exception):
+                    await self._element_context.close()
+                self._element_context = None
+            self._element_context = await self._element_browser.new_context(
+                viewport={"width": viewport_width, "height": viewport_height}
+            )
+            self._element_page = await self._element_context.new_page()
+            self._element_page_url = url
+            self._element_page_viewport = target_viewport
+            await self._element_page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            return self._element_page
+
+        if self._element_page_viewport != target_viewport:
+            await self._element_page.set_viewport_size(
+                {"width": viewport_width, "height": viewport_height}
+            )
+            self._element_page_viewport = target_viewport
+
+        return self._element_page
+
     async def _handle_get_element_at_point(self, cmd: dict[str, Any]) -> None:
-        """Get DOM element at (x, y) in the preview page and send result to control plane."""
+        """Get DOM element at (x, y) in the preview page using a long-lived Playwright page."""
         request_id = cmd.get("requestId")
         x = cmd.get("x")
         y = cmd.get("y")
@@ -1114,75 +1264,45 @@ class AgentBridge:
 
         viewport_width = cmd.get("viewportWidth")
         viewport_height = cmd.get("viewportHeight")
-        script_path = Path("/app/sandbox/get_element_at_point.py")
-        if not script_path.exists():
+        if viewport_width is None or viewport_height is None:
+            viewport_width = 1280
+            viewport_height = 720
+        else:
+            viewport_width = int(viewport_width)
+            viewport_height = int(viewport_height)
+
+        preview_url = cmd.get("url") or "http://localhost:5173"
+
+        async with self._element_at_point_lock:
+            try:
+                page = await self._ensure_element_at_point_page(
+                    preview_url, viewport_width, viewport_height
+                )
+                element = await page.evaluate(GET_ELEMENT_AT_POINT_SCRIPT, [int(x), int(y)])
+            except Exception as e:
+                print(f"[bridge] getElementAtPoint error: {e}")
+                await self._send_event(
+                    {
+                        "type": "getElementAtPointError",
+                        "requestId": request_id,
+                        "error": str(e),
+                    }
+                )
+                return
+
+        if element is None:
             await self._send_event(
                 {
                     "type": "getElementAtPointError",
                     "requestId": request_id,
-                    "error": "get_element_at_point.py not found",
+                    "error": "No element at point",
                 }
             )
             return
 
-        script_args: list[str] = [
-            "python3",
-            str(script_path),
-            "http://localhost:5173",
-            str(int(x)),
-            str(int(y)),
-        ]
-        if viewport_width is not None and viewport_height is not None:
-            script_args.extend([str(int(viewport_width)), str(int(viewport_height))])
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *script_args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-            out = stdout.decode().strip() or stderr.decode().strip()
-            if not out:
-                await self._send_event(
-                    {
-                        "type": "getElementAtPointError",
-                        "requestId": request_id,
-                        "error": "No output from script",
-                    }
-                )
-                return
-            data = json.loads(out)
-            if "error" in data:
-                await self._send_event(
-                    {
-                        "type": "getElementAtPointError",
-                        "requestId": request_id,
-                        "error": data["error"],
-                    }
-                )
-                return
-            element = data.get("element")
-            await self._send_event(
-                {"type": "getElementAtPointResponse", "requestId": request_id, "element": element}
-            )
-        except TimeoutError:
-            await self._send_event(
-                {
-                    "type": "getElementAtPointError",
-                    "requestId": request_id,
-                    "error": "Element lookup timed out",
-                }
-            )
-        except (json.JSONDecodeError, ValueError) as e:
-            await self._send_event(
-                {"type": "getElementAtPointError", "requestId": request_id, "error": str(e)}
-            )
-        except Exception as e:
-            print(f"[bridge] getElementAtPoint error: {e}")
-            await self._send_event(
-                {"type": "getElementAtPointError", "requestId": request_id, "error": str(e)}
-            )
+        await self._send_event(
+            {"type": "getElementAtPointResponse", "requestId": request_id, "element": element}
+        )
 
     async def _configure_git_identity(self, user: GitUser) -> None:
         """Configure git identity for commit attribution."""

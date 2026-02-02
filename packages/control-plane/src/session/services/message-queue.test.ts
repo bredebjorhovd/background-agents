@@ -71,7 +71,7 @@ describe("MessageQueue", () => {
 
     messageRepo = createMessageRepository(sql);
     participantRepo = createParticipantRepository(sql);
-    mockSendToSandbox = vi.fn().mockResolvedValue(undefined);
+    mockSendToSandbox = vi.fn().mockResolvedValue(true);
     mockSpawnIfNeeded = vi.fn().mockResolvedValue(undefined);
     mockGetSession = vi.fn().mockReturnValue({ model: "claude-haiku-4-5" });
 
@@ -257,6 +257,21 @@ describe("MessageQueue", () => {
   });
 
   describe("error handling", () => {
+    it("should leave message pending when sandbox not connected", async () => {
+      mockSendToSandbox.mockResolvedValueOnce(false);
+
+      const messageId = await queue.enqueue({
+        content: "test",
+        authorId: "participant-1",
+        source: "web",
+      });
+
+      await queue.processQueue();
+
+      const message = messageRepo.getById(messageId);
+      expect(message?.status).toBe("pending");
+    });
+
     it("should handle sandbox send errors gracefully", async () => {
       mockSendToSandbox.mockRejectedValueOnce(new Error("Send failed"));
 

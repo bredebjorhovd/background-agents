@@ -72,9 +72,14 @@ async function handleSpecialEvent(
   try {
     switch (event.type) {
       case "execution_complete": {
-        const data = event.data as { message_id?: string; success?: boolean } | undefined;
-        if (data?.message_id) {
-          await callbacks.onExecutionComplete(data.message_id, data.success ?? false);
+        // message_id is set by the DO from the sandbox event (which sends messageId camelCase)
+        const messageId = event.message_id;
+        const data = event.data as
+          | { messageId?: string; message_id?: string; success?: boolean; error?: string }
+          | undefined;
+        const success = data?.success ?? false;
+        if (messageId) {
+          await callbacks.onExecutionComplete(messageId, success);
           await callbacks.onProcessNextMessage();
         }
         break;

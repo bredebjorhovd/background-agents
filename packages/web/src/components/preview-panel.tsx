@@ -140,7 +140,7 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
         setSelectLoading(false);
       }
     },
-    [isSelecting, sessionId, onSelectElement, fetchElementAtPoint]
+    [isSelecting, onSelectElement, fetchElementAtPoint]
   );
 
   // Reset loading state when URL changes
@@ -225,7 +225,8 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
       <div ref={iframeContainerRef} className="flex-1 relative bg-white">
         {isSelecting && (
           <div
-            className="absolute inset-0 z-20 flex items-center justify-center bg-black/10 cursor-crosshair"
+            className="absolute inset-0 z-20 flex items-center justify-center cursor-crosshair"
+            style={{ backgroundColor: "rgba(0,0,0,0.04)" }}
             onClick={handleSelectClick}
             onMouseMove={handleHover}
             onMouseLeave={() => setHoveredRect(null)}
@@ -236,7 +237,7 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
           >
             {hoveredRect && (
               <div
-                className="absolute z-30 pointer-events-none rounded border-2 border-blue-500 bg-blue-500/20"
+                className="absolute z-30 pointer-events-none rounded border-2 border-blue-500 bg-blue-500/15 shadow-md ring-2 ring-blue-400/30"
                 style={{
                   left: hoveredRect.x,
                   top: hoveredRect.y,
@@ -246,7 +247,7 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
                 aria-hidden
               />
             )}
-            <span className="px-3 py-1.5 text-sm font-medium bg-background/90 text-foreground rounded shadow pointer-events-none">
+            <span className="px-3 py-1.5 text-sm font-medium bg-background/95 text-foreground rounded-md shadow-lg border border-border pointer-events-none">
               {selectLoading ? "Getting element…" : "Click any element to select it"}
             </span>
           </div>
