@@ -52,7 +52,11 @@ class FakeSqlStorageCursor<T extends SQLRow> implements SqlStorageCursor<T> {
   }
 }
 
-class FakeSqlStorageStatement extends SqlStorageStatement {}
+const SqlStorageStatementBase =
+  (globalThis as { SqlStorageStatement?: typeof SqlStorageStatement }).SqlStorageStatement ??
+  class {};
+
+class FakeSqlStorageStatement extends SqlStorageStatementBase {}
 
 /**
  * Minimal fake implementation of DurableObjectStorage's SQL interface.
