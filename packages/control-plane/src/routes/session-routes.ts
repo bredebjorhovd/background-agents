@@ -480,7 +480,14 @@ export async function handleSessionElementAtPoint(
   const sessionId = match.groups?.id;
   if (!sessionId) return error("Session ID required");
 
-  let body: { x: number; y: number; viewportWidth?: number; viewportHeight?: number };
+  let body: {
+    x: number;
+    y: number;
+    viewportWidth?: number;
+    viewportHeight?: number;
+    url?: string;
+    deviceScaleFactor?: number;
+  };
   try {
     body = (await request.json()) as {
       x: number;
@@ -498,13 +505,26 @@ export async function handleSessionElementAtPoint(
   const stub = getSessionStub(env, match);
   if (!stub) return error("Session ID required");
 
-  const payload: { x: number; y: number; viewportWidth?: number; viewportHeight?: number } = {
+  const payload: {
+    x: number;
+    y: number;
+    viewportWidth?: number;
+    viewportHeight?: number;
+    url?: string;
+    deviceScaleFactor?: number;
+  } = {
     x: body.x,
     y: body.y,
   };
   if (typeof body.viewportWidth === "number" && typeof body.viewportHeight === "number") {
     payload.viewportWidth = body.viewportWidth;
     payload.viewportHeight = body.viewportHeight;
+  }
+  if (typeof body.url === "string" && body.url.length > 0) {
+    payload.url = body.url;
+  }
+  if (typeof body.deviceScaleFactor === "number" && Number.isFinite(body.deviceScaleFactor)) {
+    payload.deviceScaleFactor = body.deviceScaleFactor;
   }
   const response = await stub.fetch(
     new Request("http://internal/internal/element-at-point", {

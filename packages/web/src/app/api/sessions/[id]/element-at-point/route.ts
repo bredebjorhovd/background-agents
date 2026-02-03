@@ -12,6 +12,8 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
     y: number;
     viewportWidth?: number;
     viewportHeight?: number;
+    url?: string;
+    deviceScaleFactor?: number;
   };
   try {
     body = await _request.json();
@@ -19,18 +21,31 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const { x, y, viewportWidth, viewportHeight } = body;
+  const { x, y, viewportWidth, viewportHeight, url, deviceScaleFactor } = body;
   if (typeof x !== "number" || typeof y !== "number") {
     return NextResponse.json({ error: "x and y (numbers) required" }, { status: 400 });
   }
 
-  const payload: { x: number; y: number; viewportWidth?: number; viewportHeight?: number } = {
+  const payload: {
+    x: number;
+    y: number;
+    viewportWidth?: number;
+    viewportHeight?: number;
+    url?: string;
+    deviceScaleFactor?: number;
+  } = {
     x,
     y,
   };
   if (typeof viewportWidth === "number" && typeof viewportHeight === "number") {
     payload.viewportWidth = viewportWidth;
     payload.viewportHeight = viewportHeight;
+  }
+  if (typeof url === "string" && url.length > 0) {
+    payload.url = url;
+  }
+  if (typeof deviceScaleFactor === "number" && Number.isFinite(deviceScaleFactor)) {
+    payload.deviceScaleFactor = deviceScaleFactor;
   }
 
   try {

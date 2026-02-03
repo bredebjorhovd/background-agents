@@ -1583,6 +1583,8 @@ export class SessionDO extends DurableObject<Env> {
       y: number;
       viewportWidth?: number;
       viewportHeight?: number;
+      url?: string;
+      deviceScaleFactor?: number;
     };
     if (typeof body.x !== "number" || typeof body.y !== "number") {
       return new Response(JSON.stringify({ error: "x and y required" }), {
@@ -1621,6 +1623,12 @@ export class SessionDO extends DurableObject<Env> {
     if (typeof body.viewportWidth === "number" && typeof body.viewportHeight === "number") {
       payload.viewportWidth = body.viewportWidth;
       payload.viewportHeight = body.viewportHeight;
+    }
+    if (typeof body.url === "string" && body.url.length > 0) {
+      payload.url = body.url;
+    }
+    if (typeof body.deviceScaleFactor === "number" && Number.isFinite(body.deviceScaleFactor)) {
+      payload.deviceScaleFactor = body.deviceScaleFactor;
     }
     this.wsManager!.safeSend(sandboxWs, payload);
 

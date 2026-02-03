@@ -8,6 +8,7 @@ export interface SelectedElementInfo {
   tagName: string;
   react?: { name: string; props?: Record<string, unknown> };
   text?: string;
+  viewport?: { width: number; height: number; devicePixelRatio?: number };
 }
 
 interface BoundingRect {
@@ -23,7 +24,7 @@ interface PreviewPanelProps {
   onSelectElement?: (element: SelectedElementInfo) => void;
 }
 
-const HOVER_THROTTLE_MS = 120;
+const HOVER_THROTTLE_MS = 60;
 
 export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewPanelProps) {
   const [isLoading, setIsLoading] = useState(true);
@@ -32,13 +33,22 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
   const [isSelecting, setIsSelecting] = useState(false);
   const [selectLoading, setSelectLoading] = useState(false);
   const [hoveredRect, setHoveredRect] = useState<BoundingRect | null>(null);
+  const [hoveredElement, setHoveredElement] = useState<SelectedElementInfo | null>(null);
+  const [hoveredPoint, setHoveredPoint] = useState<{ x: number; y: number } | null>(null);
   const iframeContainerRef = useRef<HTMLDivElement>(null);
   const hoverThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverRequestIdRef = useRef(0);
+  const hoverPointRef = useRef<{ x: number; y: number } | null>(null);
+  const remoteViewportRef = useRef<{ width: number; height: number } | null>(null);
 
   // Find the preview artifact
   const previewArtifact = artifacts.find((a) => a.type === "preview");
   const previewUrl = previewArtifact?.url;
+  const hoveredLabel =
+    hoveredElement?.react?.name ??
+    hoveredElement?.tagName ??
+    hoveredElement?.selector ??
+    (hoveredRect ? "Unknown element" : null);
 
   const handleRefresh = useCallback(() => {
     setIframeKey((k) => k + 1);
@@ -62,6 +72,10 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
       viewportWidth: number,
       viewportHeight: number
     ): Promise<{ element?: SelectedElementInfo; boundingRect?: BoundingRect; error?: string }> => {
+      const deviceScaleFactor =
+        typeof window !== "undefined" && Number.isFinite(window.devicePixelRatio)
+          ? window.devicePixelRatio
+          : undefined;
       const res = await fetch(`/api/sessions/${sessionId}/element-at-point`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -70,6 +84,8 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
           y,
           viewportWidth,
           viewportHeight,
+          url: previewUrl ?? undefined,
+          deviceScaleFactor,
         }),
       });
       const data = await res.json();
@@ -87,7 +103,7 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
             : undefined,
       };
     },
-    [sessionId]
+    [sessionId, previewUrl]
   );
 
   const handleHover = useCallback(
@@ -100,15 +116,54 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
       const viewportWidth = Math.round(rect.width);
       const viewportHeight = Math.round(rect.height);
       if (viewportWidth <= 0 || viewportHeight <= 0) return;
+      hoverPointRef.current = { x, y };
 
       if (hoverThrottleRef.current !== null) return;
       hoverThrottleRef.current = setTimeout(() => {
         hoverThrottleRef.current = null;
         const requestId = ++hoverRequestIdRef.current;
-        fetchElementAtPoint(x, y, viewportWidth, viewportHeight).then((result) => {
+        const remoteViewport = remoteViewportRef.current;
+        const scaleX =
+          remoteViewport && remoteViewport.width > 0 ? remoteViewport.width / viewportWidth : 1;
+        const scaleY =
+          remoteViewport && remoteViewport.height > 0 ? remoteViewport.height / viewportHeight : 1;
+        const scaledX = x * scaleX;
+        const scaledY = y * scaleY;
+        fetchElementAtPoint(scaledX, scaledY, viewportWidth, viewportHeight).then((result) => {
           if (requestId !== hoverRequestIdRef.current) return;
-          if (result.boundingRect) setHoveredRect(result.boundingRect);
-          else setHoveredRect(null);
+          if (result.element?.viewport?.width && result.element?.viewport?.height) {
+            remoteViewportRef.current = {
+              width: result.element.viewport.width,
+              height: result.element.viewport.height,
+            };
+          }
+          if (result.boundingRect) {
+            const responseViewport = result.element?.viewport;
+            const responseScaleX =
+              responseViewport && responseViewport.width > 0
+                ? viewportWidth / responseViewport.width
+                : 1;
+            const responseScaleY =
+              responseViewport && responseViewport.height > 0
+                ? viewportHeight / responseViewport.height
+                : 1;
+            const localPoint = hoverPointRef.current;
+            const width = result.boundingRect.width * responseScaleX;
+            const height = result.boundingRect.height * responseScaleY;
+            const translateX =
+              localPoint?.x !== undefined ? localPoint.x - scaledX * responseScaleX : 0;
+            const translateY =
+              localPoint?.y !== undefined ? localPoint.y - scaledY * responseScaleY : 0;
+            const x = result.boundingRect.x * responseScaleX + translateX;
+            const y = result.boundingRect.y * responseScaleY + translateY;
+            setHoveredRect({ x, y, width, height });
+            setHoveredElement(result.element ?? null);
+            setHoveredPoint(hoverPointRef.current);
+          } else {
+            setHoveredRect(null);
+            setHoveredElement(null);
+            setHoveredPoint(null);
+          }
         });
       }, HOVER_THROTTLE_MS);
     },
@@ -124,11 +179,26 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
       const y = e.clientY - rect.top;
       const viewportWidth = Math.round(rect.width);
       const viewportHeight = Math.round(rect.height);
+      const remoteViewport = remoteViewportRef.current;
+      const scaleX =
+        remoteViewport && remoteViewport.width > 0 ? remoteViewport.width / viewportWidth : 1;
+      const scaleY =
+        remoteViewport && remoteViewport.height > 0 ? remoteViewport.height / viewportHeight : 1;
+      const scaledX = x * scaleX;
+      const scaledY = y * scaleY;
       setSelectLoading(true);
       setHoveredRect(null);
+      setHoveredElement(null);
+      setHoveredPoint(null);
       try {
-        const result = await fetchElementAtPoint(x, y, viewportWidth, viewportHeight);
+        const result = await fetchElementAtPoint(scaledX, scaledY, viewportWidth, viewportHeight);
         if (result.element) {
+          if (result.element.viewport?.width && result.element.viewport?.height) {
+            remoteViewportRef.current = {
+              width: result.element.viewport.width,
+              height: result.element.viewport.height,
+            };
+          }
           onSelectElement(result.element);
           setIsSelecting(false);
         } else {
@@ -153,7 +223,12 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
 
   // Clear hover highlight when leaving select mode
   useEffect(() => {
-    if (!isSelecting) setHoveredRect(null);
+    if (!isSelecting) {
+      setHoveredRect(null);
+      setHoveredElement(null);
+      setHoveredPoint(null);
+      remoteViewportRef.current = null;
+    }
   }, [isSelecting]);
 
   if (!previewUrl) {
@@ -229,23 +304,40 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
             style={{ backgroundColor: "rgba(0,0,0,0.04)" }}
             onClick={handleSelectClick}
             onMouseMove={handleHover}
-            onMouseLeave={() => setHoveredRect(null)}
+            onMouseLeave={() => {
+              setHoveredRect(null);
+              setHoveredElement(null);
+              setHoveredPoint(null);
+            }}
             onKeyDown={(e) => e.key === "Escape" && setIsSelecting(false)}
             role="button"
             tabIndex={0}
             aria-label="Click an element in the preview to select it"
           >
             {hoveredRect && (
-              <div
-                className="absolute z-30 pointer-events-none rounded border-2 border-blue-500 bg-blue-500/15 shadow-md ring-2 ring-blue-400/30"
-                style={{
-                  left: hoveredRect.x,
-                  top: hoveredRect.y,
-                  width: Math.max(0, hoveredRect.width),
-                  height: Math.max(0, hoveredRect.height),
-                }}
-                aria-hidden
-              />
+              <>
+                <div
+                  className="absolute z-30 pointer-events-none rounded border-2 border-blue-500 bg-blue-500/15 shadow-md ring-2 ring-blue-400/30"
+                  style={{
+                    left: hoveredRect.x,
+                    top: hoveredRect.y,
+                    width: Math.max(0, hoveredRect.width),
+                    height: Math.max(0, hoveredRect.height),
+                  }}
+                  aria-hidden
+                />
+                {hoveredLabel && (
+                  <div
+                    className="absolute z-30 pointer-events-none max-w-[240px] px-2 py-0.5 text-[11px] font-medium bg-blue-600 text-white rounded shadow-md whitespace-nowrap overflow-hidden text-ellipsis"
+                    style={{
+                      left: (hoveredPoint?.x ?? hoveredRect.x) + 10,
+                      top: Math.max(0, (hoveredPoint?.y ?? hoveredRect.y) - 26),
+                    }}
+                  >
+                    {hoveredLabel}
+                  </div>
+                )}
+              </>
             )}
             <span className="px-3 py-1.5 text-sm font-medium bg-background/95 text-foreground rounded-md shadow-lg border border-border pointer-events-none">
               {selectLoading ? "Getting element…" : "Click any element to select it"}

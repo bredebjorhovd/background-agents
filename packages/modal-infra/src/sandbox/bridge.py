@@ -82,11 +82,17 @@ GET_ELEMENT_AT_POINT_SCRIPT = """
   const selector = generateSelector(el);
   const react = getReactInfo(el);
   const rect = el.getBoundingClientRect();
+  const root = document.documentElement;
   return {
     selector,
     tagName: el.tagName.toLowerCase(),
     text: el.innerText ? el.innerText.slice(0, 200) : null,
     react: react || undefined,
+    viewport: {
+      width: root?.clientWidth || window.innerWidth,
+      height: root?.clientHeight || window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio
+    },
     boundingRect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
   };
 }
@@ -217,6 +223,7 @@ class AgentBridge:
         self._element_page: Any = None
         self._element_page_url: str | None = None
         self._element_page_viewport: tuple[int, int] | None = None
+        self._element_page_scale: float | None = None
 
         # Message ID of the prompt currently being processed (for stop → execution_complete)
         self._current_prompt_message_id: str | None = None
@@ -1196,18 +1203,26 @@ class AgentBridge:
             )
 
     async def _ensure_element_at_point_page(
-        self, url: str, viewport_width: int, viewport_height: int
+        self,
+        url: str,
+        viewport_width: int,
+        viewport_height: int,
+        device_scale_factor: float | None,
     ) -> Any:
         """Ensure we have a Playwright page for the preview URL and viewport. Reuses a long-lived page."""
         if viewport_width <= 0 or viewport_height <= 0:
             viewport_width = 1280
             viewport_height = 720
         target_viewport = (viewport_width, viewport_height)
+        target_scale = (
+            device_scale_factor if device_scale_factor and device_scale_factor > 0 else 1.0
+        )
 
         if (
             self._element_page is not None
             and self._element_page_url == url
             and self._element_page_viewport == target_viewport
+            and self._element_page_scale == target_scale
         ):
             return self._element_page
 
@@ -1221,7 +1236,11 @@ class AgentBridge:
             self._element_playwright = await self._element_playwright_cm.__aenter__()
             self._element_browser = await self._element_playwright.chromium.launch(headless=True)
 
-        if self._element_page is None or self._element_page_url != url:
+        if (
+            self._element_page is None
+            or self._element_page_url != url
+            or self._element_page_scale != target_scale
+        ):
             if self._element_page is not None:
                 with contextlib.suppress(Exception):
                     await self._element_page.close()
@@ -1231,11 +1250,13 @@ class AgentBridge:
                     await self._element_context.close()
                 self._element_context = None
             self._element_context = await self._element_browser.new_context(
-                viewport={"width": viewport_width, "height": viewport_height}
+                viewport={"width": viewport_width, "height": viewport_height},
+                device_scale_factor=target_scale,
             )
             self._element_page = await self._element_context.new_page()
             self._element_page_url = url
             self._element_page_viewport = target_viewport
+            self._element_page_scale = target_scale
             await self._element_page.goto(url, wait_until="domcontentloaded", timeout=15000)
             return self._element_page
 
@@ -1264,19 +1285,25 @@ class AgentBridge:
 
         viewport_width = cmd.get("viewportWidth")
         viewport_height = cmd.get("viewportHeight")
+        device_scale_factor = cmd.get("deviceScaleFactor")
         if viewport_width is None or viewport_height is None:
             viewport_width = 1280
             viewport_height = 720
         else:
             viewport_width = int(viewport_width)
             viewport_height = int(viewport_height)
+        try:
+            if device_scale_factor is not None:
+                device_scale_factor = float(device_scale_factor)
+        except (TypeError, ValueError):
+            device_scale_factor = None
 
         preview_url = cmd.get("url") or "http://localhost:5173"
 
         async with self._element_at_point_lock:
             try:
                 page = await self._ensure_element_at_point_page(
-                    preview_url, viewport_width, viewport_height
+                    preview_url, viewport_width, viewport_height, device_scale_factor
                 )
                 element = await page.evaluate(GET_ELEMENT_AT_POINT_SCRIPT, [int(x), int(y)])
             except Exception as e:

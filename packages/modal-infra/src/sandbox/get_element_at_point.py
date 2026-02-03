@@ -63,11 +63,17 @@ GET_ELEMENT_SCRIPT = """
   const selector = generateSelector(el);
   const react = getReactInfo(el);
   const rect = el.getBoundingClientRect();
+  const root = document.documentElement;
   return {
     selector,
     tagName: el.tagName.toLowerCase(),
     text: el.innerText ? el.innerText.slice(0, 200) : null,
     react: react || undefined,
+    viewport: {
+      width: root?.clientWidth || window.innerWidth,
+      height: root?.clientHeight || window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio
+    },
     boundingRect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
   };
 }
