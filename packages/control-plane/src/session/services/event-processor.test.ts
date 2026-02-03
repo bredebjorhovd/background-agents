@@ -104,7 +104,7 @@ describe("EventProcessor", () => {
       const events = eventRepo.list({});
       expect(events).toHaveLength(1);
       expect(events[0].type).toBe("simple_event");
-      expect(events[0].data).toBeNull();
+      expect(events[0].data).toBe("{}");
     });
   });
 
