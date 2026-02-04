@@ -61,6 +61,28 @@ export interface WarmSandboxResponse {
   status: string;
 }
 
+export interface RestoreSandboxRequest {
+  snapshotImageId: string;
+  sessionConfig: {
+    session_id: string;
+    repo_owner: string;
+    repo_name: string;
+    provider: string;
+    model: string;
+  };
+  sandboxId?: string;
+  controlPlaneUrl: string;
+  sandboxAuthToken: string;
+}
+
+export interface RestoreSandboxResponse {
+  sandboxId: string;
+  status: string;
+  modalObjectId?: string;
+  previewTunnelUrl?: string;
+  tunnelUrls?: Record<number, string>;
+}
+
 export interface SnapshotInfo {
   id: string;
   repoOwner: string;
@@ -239,6 +261,49 @@ export class ModalClient {
     return {
       sandboxId: result.data.sandbox_id,
       status: result.data.status,
+    };
+  }
+
+  /**
+   * Restore a sandbox from a snapshot image.
+   */
+  async restoreSandbox(request: RestoreSandboxRequest): Promise<RestoreSandboxResponse> {
+    const headers = await this.getPostHeaders();
+    const response = await fetch(this.restoreSandboxUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        snapshot_image_id: request.snapshotImageId,
+        session_config: request.sessionConfig,
+        sandbox_id: request.sandboxId || null,
+        control_plane_url: request.controlPlaneUrl,
+        sandbox_auth_token: request.sandboxAuthToken,
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Modal API error: ${response.status} ${text}`);
+    }
+
+    const result = (await response.json()) as ModalApiResponse<{
+      sandbox_id: string;
+      status: string;
+      modal_object_id?: string;
+      preview_tunnel_url?: string;
+      tunnel_urls?: Record<number, string>;
+    }>;
+
+    if (!result.success || !result.data) {
+      throw new Error(`Modal API error: ${result.error || "Unknown error"}`);
+    }
+
+    return {
+      sandboxId: result.data.sandbox_id,
+      status: result.data.status,
+      modalObjectId: result.data.modal_object_id,
+      previewTunnelUrl: result.data.preview_tunnel_url,
+      tunnelUrls: result.data.tunnel_urls,
     };
   }
 

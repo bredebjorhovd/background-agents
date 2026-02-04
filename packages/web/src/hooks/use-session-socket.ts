@@ -503,10 +503,6 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
     };
     setEvents((prev) => [...prev, userMessageEvent]);
 
-    // Optimistically set isProcessing for immediate feedback
-    // Server will confirm with processing_status message
-    setSessionState((prev) => (prev ? { ...prev, isProcessing: true } : null));
-
     wsRef.current.send(
       JSON.stringify({
         type: "prompt",
@@ -518,6 +514,10 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
 
   const stopExecution = useCallback(() => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      // Fallback to HTTP stop if WS isn't open
+      void fetch(`/api/sessions/${sessionId}/stop`, { method: "POST" });
+      // Optimistically unlock UI
+      setSessionState((prev) => (prev ? { ...prev, isProcessing: false } : prev));
       return;
     }
     // Preserve partial content when stopping
@@ -535,7 +535,11 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
       ]);
     }
     wsRef.current.send(JSON.stringify({ type: "stop" }));
-  }, []);
+    // Also hit HTTP stop as a fallback in case WS drops
+    void fetch(`/api/sessions/${sessionId}/stop`, { method: "POST" });
+    // Optimistically unlock UI; server will confirm with processing_status
+    setSessionState((prev) => (prev ? { ...prev, isProcessing: false } : prev));
+  }, [sessionId]);
 
   const sendTyping = useCallback(() => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {

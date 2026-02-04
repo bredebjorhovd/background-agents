@@ -12,6 +12,10 @@ interface SandboxManagerDependencies {
     object_id: string;
   }>;
   modalSnapshot: (options: { reason: string }) => Promise<{ snapshot_id: string }>;
+  modalRestore?: (options: { snapshotImageId: string }) => Promise<{
+    sandbox_id: string;
+    object_id: string;
+  }>;
 }
 
 // Constants
@@ -23,7 +27,7 @@ const INACTIVITY_TIMEOUT = 30 * 60 * 1000; // 30 minutes
  * Create a SandboxManager instance.
  */
 export function createSandboxManager(deps: SandboxManagerDependencies): SandboxManager {
-  const { sandboxRepo, modalSpawn, modalSnapshot } = deps;
+  const { sandboxRepo, modalSpawn, modalSnapshot, modalRestore } = deps;
 
   return {
     async spawnSandbox(): Promise<void> {
@@ -52,8 +56,10 @@ export function createSandboxManager(deps: SandboxManagerDependencies): SandboxM
 
     async restoreFromSnapshot(snapshotId: string): Promise<void> {
       try {
-        // Call Modal API to spawn sandbox with snapshot
-        const result = await modalSpawn({ snapshotId });
+        // Call Modal API to restore sandbox from snapshot image (fallback to spawn if unavailable)
+        const result = modalRestore
+          ? await modalRestore({ snapshotImageId: snapshotId })
+          : await modalSpawn({ snapshotId });
 
         // Update repository with spawn result
         sandboxRepo.update({
@@ -94,8 +100,9 @@ export function createSandboxManager(deps: SandboxManagerDependencies): SandboxM
     async triggerSnapshot(reason: string): Promise<void> {
       const result = await modalSnapshot({ reason });
 
-      // Update sandbox repository with new snapshot ID
-      sandboxRepo.updateSnapshot(result.snapshot_id);
+      // Update sandbox repository with new snapshot ID and image ID (same value from Modal)
+      // snapshot_image_id is used to restore sessions; keep snapshot_id for compatibility.
+      sandboxRepo.updateSnapshot(result.snapshot_id, result.snapshot_id);
     },
 
     isInactive(): boolean {

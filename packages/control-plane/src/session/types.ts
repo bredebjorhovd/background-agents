@@ -101,11 +101,18 @@ export interface SandboxRow {
 
 // Command types for sandbox communication
 
+export interface ToolPolicy {
+  mode: "allowlist";
+  allowedTools: string[];
+  reason?: string;
+}
+
 export interface PromptCommand {
   type: "prompt";
   messageId: string;
   content: string;
   model?: string; // LLM model for per-message override
+  toolPolicy?: ToolPolicy;
   author: {
     userId: string;
     githubName: string | null;
@@ -117,6 +124,14 @@ export interface PromptCommand {
     url?: string;
     content?: string;
   }>;
+}
+
+export interface StartPreviewCommand {
+  type: "start_preview";
+  messageId: string;
+  workdir?: string;
+  skipInstall?: boolean;
+  skipConfig?: boolean;
 }
 
 export interface StopCommand {
@@ -131,7 +146,12 @@ export interface ShutdownCommand {
   type: "shutdown";
 }
 
-export type SandboxCommand = PromptCommand | StopCommand | SnapshotCommand | ShutdownCommand;
+export type SandboxCommand =
+  | PromptCommand
+  | StartPreviewCommand
+  | StopCommand
+  | SnapshotCommand
+  | ShutdownCommand;
 
 // Internal session update types
 

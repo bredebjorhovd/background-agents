@@ -171,6 +171,12 @@ class SSEConnectionError(Exception):
     pass
 
 
+class ToolPolicyError(Exception):
+    """Raised when a tool call violates an allowlist policy."""
+
+    pass
+
+
 class AgentBridge:
     """
     Bridge between sandbox OpenCode instance and control plane.
@@ -227,6 +233,8 @@ class AgentBridge:
 
         # Message ID of the prompt currently being processed (for stop → execution_complete)
         self._current_prompt_message_id: str | None = None
+        # Track current prompt task so stop can cancel streaming/logs cleanly
+        self._prompt_task: asyncio.Task[None] | None = None
 
     @property
     def ws_url(self) -> str:
@@ -368,8 +376,11 @@ class AgentBridge:
         if cmd_type == "prompt":
             message_id = cmd.get("messageId") or cmd.get("message_id", "unknown")
             task = asyncio.create_task(self._handle_prompt(cmd))
+            self._prompt_task = task
 
             def handle_task_exception(t: asyncio.Task[None], mid: str = message_id) -> None:
+                if self._prompt_task is t:
+                    self._prompt_task = None
                 if t.cancelled():
                     asyncio.create_task(
                         self._send_event(
@@ -417,6 +428,12 @@ class AgentBridge:
         content = cmd.get("content", "")
         model = cmd.get("model")
         author_data = cmd.get("author", {})
+        tool_policy = cmd.get("toolPolicy") or {}
+        allowed_tools: set[str] | None = None
+        if tool_policy.get("mode") == "allowlist":
+            allowed = tool_policy.get("allowedTools") or tool_policy.get("allowed_tools")
+            if isinstance(allowed, list) and allowed:
+                allowed_tools = {str(tool) for tool in allowed if tool}
 
         print(f"[bridge] Processing prompt {message_id} with model {model}, author={author_data}")
 
@@ -435,7 +452,9 @@ class AgentBridge:
             if not self.opencode_session_id:
                 await self._create_opencode_session()
 
-            async for event in self._stream_opencode_response_sse(message_id, content, model):
+            async for event in self._stream_opencode_response_sse(
+                message_id, content, model, allowed_tools
+            ):
                 await self._send_event(event)
 
             await self._send_event(
@@ -497,6 +516,15 @@ class AgentBridge:
         elif part_type == "tool":
             state = part.get("state", {})
             status = state.get("status", "")
+            tool_name = part.get("tool", "")
+            call_id = (
+                part.get("callID")
+                or part.get("callId")
+                or state.get("callID")
+                or state.get("callId")
+                or part.get("id")
+                or ""
+            )
             # OpenCode may put tool args in state.input, state.args, state.raw, or top-level part.input / part.args
             tool_input = (
                 state.get("input")
@@ -521,7 +549,30 @@ class AgentBridge:
                         pass
 
             output = state.get("output", "")
-            tool_name = part.get("tool", "")
+            if not output:
+                # Surface tool errors if output is empty
+                error_info = (
+                    state.get("error")
+                    or state.get("message")
+                    or part.get("error")
+                    or part.get("message")
+                    or part.get("result")
+                )
+                if isinstance(error_info, dict) and error_info.get("message"):
+                    output = error_info.get("message")
+                else:
+                    output = error_info or ""
+                if not output and status == "error":
+                    output = "Tool failed with no output (check sandbox logs)."
+            if output is None:
+                output = ""
+            elif isinstance(output, dict) and output.get("content"):
+                output = output.get("content")
+            elif not isinstance(output, str):
+                try:
+                    output = json.dumps(output)
+                except (TypeError, ValueError):
+                    output = str(output)
             has_todos = isinstance(tool_input.get("todos"), list)
             print(
                 f"[bridge] Tool part: tool={tool_name}, status={status}, "
@@ -532,8 +583,8 @@ class AgentBridge:
                     f"[bridge] Tool error output: {output[:500]}{'...' if len(output) > 500 else ''}"
                 )
 
-            # Skip only when we have no args and part is still pending (args may arrive in a later update)
-            if status in ("pending", "") and not tool_input:
+            # Skip only when we have no tool name and no args (avoid swallowing no-arg tools)
+            if not tool_name and status in ("pending", "") and not tool_input:
                 print(
                     f"[bridge] Skipping tool_call (no input yet): part_keys={list(part.keys())}, "
                     f"state_keys={list(state.keys()) if state else []}"
@@ -542,11 +593,11 @@ class AgentBridge:
 
             return {
                 "type": "tool_call",
-                "tool": part.get("tool", ""),
+                "tool": tool_name,
                 "args": tool_input,
-                "callId": part.get("callID", ""),
+                "callId": call_id,
                 "status": status,
-                "output": state.get("output", ""),
+                "output": output,
                 "messageId": message_id,
             }
         elif part_type == "step-finish":
@@ -639,6 +690,7 @@ class AgentBridge:
         message_id: str,
         content: str,
         model: str | None = None,
+        allowed_tools: set[str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream response from OpenCode using Server-Sent Events.
 
@@ -668,6 +720,7 @@ class AgentBridge:
         our_assistant_msg_ids: set[str] = set()
         # Parts that arrived before we saw message.updated; flush when we see assistant msg
         buffered_parts_by_msg_id: dict[str, list[dict[str, Any]]] = {}
+        policy_violation_triggered = False
 
         max_wait_time = 600.0  # Increased from 300s to support longer-running agents
         start_time = time.time()
@@ -779,9 +832,28 @@ class AgentBridge:
                                                 part, message_id
                                             )
                                             if tool_event:
-                                                state = part.get("state", {})
-                                                status = state.get("status", "")
-                                                call_id = part.get("callID", "")
+                                                if (
+                                                    allowed_tools
+                                                    and not policy_violation_triggered
+                                                    and tool_event.get("tool")
+                                                    and tool_event.get("tool") not in allowed_tools
+                                                ):
+                                                    policy_violation_triggered = True
+                                                    allowed_list = ", ".join(sorted(allowed_tools))
+                                                    reason = (
+                                                        f"Tool '{tool_event.get('tool')}' is not allowed "
+                                                        f"for this request. Allowed tools: {allowed_list}."
+                                                    )
+                                                    print(
+                                                        f"[bridge] Tool policy violation: {reason}"
+                                                    )
+                                                    tool_event["status"] = "error"
+                                                    tool_event["output"] = reason
+                                                    yield tool_event
+                                                    await self._stop_opencode_execution()
+                                                    raise ToolPolicyError(reason)
+                                                status = tool_event.get("status", "")
+                                                call_id = tool_event.get("callId", "")
                                                 tool_key = f"tool:{call_id}:{status}"
                                                 if tool_key not in emitted_tool_states:
                                                     emitted_tool_states.add(tool_key)
@@ -860,9 +932,26 @@ class AgentBridge:
                             elif part_type == "tool":
                                 tool_event = self._transform_part_to_event(part, message_id)
                                 if tool_event:
-                                    state = part.get("state", {})
-                                    status = state.get("status", "")
-                                    call_id = part.get("callID", "")
+                                    if (
+                                        allowed_tools
+                                        and not policy_violation_triggered
+                                        and tool_event.get("tool")
+                                        and tool_event.get("tool") not in allowed_tools
+                                    ):
+                                        policy_violation_triggered = True
+                                        allowed_list = ", ".join(sorted(allowed_tools))
+                                        reason = (
+                                            f"Tool '{tool_event.get('tool')}' is not allowed "
+                                            f"for this request. Allowed tools: {allowed_list}."
+                                        )
+                                        print(f"[bridge] Tool policy violation: {reason}")
+                                        tool_event["status"] = "error"
+                                        tool_event["output"] = reason
+                                        yield tool_event
+                                        await self._stop_opencode_execution()
+                                        raise ToolPolicyError(reason)
+                                    status = tool_event.get("status", "")
+                                    call_id = tool_event.get("callId", "")
                                     tool_key = f"tool:{call_id}:{status}"
 
                                     if tool_key not in emitted_tool_states:
@@ -1063,13 +1152,10 @@ class AgentBridge:
         """Handle stop command - halt current execution and clear processing state."""
         print("[bridge] Stopping current execution")
 
-        if self.http_client and self.opencode_session_id:
-            try:
-                await self.http_client.post(
-                    f"{self.opencode_base_url}/session/{self.opencode_session_id}/stop",
-                )
-            except Exception as e:
-                print(f"[bridge] Error stopping execution: {e}")
+        if self._prompt_task and not self._prompt_task.done():
+            self._prompt_task.cancel()
+
+        await self._stop_opencode_execution()
 
         # Always send execution_complete so the control plane clears processing and the UI unlocks
         current_id = self._current_prompt_message_id
@@ -1083,6 +1169,16 @@ class AgentBridge:
                 }
             )
             self._current_prompt_message_id = None
+
+    async def _stop_opencode_execution(self) -> None:
+        """Request OpenCode to stop current execution."""
+        if self.http_client and self.opencode_session_id:
+            try:
+                await self.http_client.post(
+                    f"{self.opencode_base_url}/session/{self.opencode_session_id}/stop",
+                )
+            except Exception as e:
+                print(f"[bridge] Error stopping execution: {e}")
 
     async def _handle_snapshot(self) -> None:
         """Handle snapshot command - prepare for snapshot."""

@@ -290,6 +290,9 @@ export class SessionDO extends DurableObject<Env> {
       modalSpawn: async (options) => {
         return await this.spawnSandboxViaModal(options);
       },
+      modalRestore: async (options) => {
+        return await this.restoreSandboxViaModal(options);
+      },
       modalSnapshot: async (options) => {
         return await this.snapshotSandboxViaModal(options);
       },
@@ -1356,7 +1359,7 @@ export class SessionDO extends DurableObject<Env> {
     // Only use created_at for cooldown if we have ever spawned (modal_sandbox_id set);
     // otherwise created_at is session creation time and would block first spawn for 30s
     const lastSpawnTime = sandbox?.modal_sandbox_id != null ? (sandbox?.created_at ?? 0) : 0;
-    const snapshotImageId = sandbox?.snapshot_image_id;
+    const snapshotImageId = sandbox?.snapshot_image_id ?? sandbox?.snapshot_id;
     const now = Date.now();
     const timeSinceLastSpawn = lastSpawnTime > 0 ? now - lastSpawnTime : Number.POSITIVE_INFINITY;
 
@@ -1414,7 +1417,12 @@ export class SessionDO extends DurableObject<Env> {
     }
 
     // Cooldown: don't spawn if last spawn was within 30 seconds
-    if (timeSinceLastSpawn < 30000 && currentStatus !== "failed" && currentStatus !== "stopped") {
+    if (
+      timeSinceLastSpawn < 30000 &&
+      currentStatus !== "failed" &&
+      currentStatus !== "stopped" &&
+      currentStatus !== "stale"
+    ) {
       console.log(`[DO] spawnSandbox: last spawn was ${timeSinceLastSpawn / 1000}s ago, waiting`);
       return;
     }
@@ -1453,6 +1461,7 @@ export class SessionDO extends DurableObject<Env> {
     if (sandboxWs) {
       this.wsManager!.safeSend(sandboxWs, { type: "stop" });
     }
+    await this.forceCompleteProcessing("Stopped by user");
   }
 
   /**
@@ -2057,7 +2066,7 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   private handleStop(): Response {
-    this.stopExecution();
+    this.ctx.waitUntil(this.stopExecution());
     return Response.json({ status: "stopping" });
   }
 
@@ -2736,6 +2745,10 @@ export class SessionDO extends DurableObject<Env> {
       console.error("[DO] execution_complete: message not found for messageId:", messageId);
       return;
     }
+    if (message.status !== "processing") {
+      // Ignore duplicate completion events (e.g., stop fallback + sandbox completion)
+      return;
+    }
 
     const now = Date.now();
 
@@ -2758,6 +2771,25 @@ export class SessionDO extends DurableObject<Env> {
     // Reset activity timer - give user time to review output before inactivity timeout
     this.sandboxManager!.updateActivity();
     await this.scheduleInactivityCheck();
+  }
+
+  /**
+   * Force-complete a stuck processing message and broadcast status.
+   */
+  private async forceCompleteProcessing(reason: string): Promise<void> {
+    this.initServices();
+    const processing = this.messageRepo.getProcessing();
+    if (!processing || !this.eventProcessor) {
+      // Ensure clients aren't stuck if we lost state but UI thinks we're processing
+      this.broadcast({ type: "processing_status", isProcessing: this.getIsProcessing() });
+      return;
+    }
+
+    await this.eventProcessor.processEvent({
+      type: "execution_complete",
+      data: { success: false, error: reason, messageId: processing.id },
+      message_id: processing.id,
+    });
   }
 
   /**
@@ -2854,7 +2886,106 @@ export class SessionDO extends DurableObject<Env> {
       console.log(`[DO] Stored modal_object_id: ${result.modalObjectId}`);
     }
 
-    // Store tunnel URLs and create preview artifact if available
+    this.applyPreviewArtifacts(result, now);
+
+    return {
+      sandbox_id: expectedSandboxId,
+      object_id: result.modalObjectId || "",
+    };
+  }
+
+  /**
+   * Restore a sandbox via Modal snapshot restore API.
+   */
+  private async restoreSandboxViaModal(options: { snapshotImageId: string }): Promise<{
+    sandbox_id: string;
+    object_id: string;
+  }> {
+    const session = this.sessionRepo.get();
+    if (!session) {
+      throw new Error("Session not found");
+    }
+
+    // Verify Modal configuration
+    if (!this.env.MODAL_API_SECRET) {
+      throw new Error("MODAL_API_SECRET not configured");
+    }
+    if (!this.env.MODAL_WORKSPACE) {
+      throw new Error("MODAL_WORKSPACE not configured");
+    }
+
+    const now = Date.now();
+    const sessionId = session.session_name || this.ctx.id.toString();
+    const sandboxAuthToken = generateId();
+    const expectedSandboxId = `sandbox-${session.repo_owner}-${session.repo_name}-${now}`;
+
+    // Get control plane URL
+    const controlPlaneUrl =
+      this.env.WORKER_URL ||
+      `https://open-inspect-control-plane.${this.env.CF_ACCOUNT_ID || "workers"}.workers.dev`;
+
+    // Store status, auth token, and expected sandbox ID BEFORE calling Modal
+    this.sql.exec(
+      `UPDATE sandbox SET
+         status = 'spawning',
+         created_at = ?,
+         auth_token = ?,
+         modal_sandbox_id = ?
+       WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
+      now,
+      sandboxAuthToken,
+      expectedSandboxId
+    );
+    this.broadcast({ type: "sandbox_status", status: "spawning" });
+
+    const modalClient = createModalClient(this.env.MODAL_API_SECRET, this.env.MODAL_WORKSPACE);
+    const { provider, model } = extractProviderAndModel(session.model || DEFAULT_MODEL);
+    const result = await modalClient.restoreSandbox({
+      snapshotImageId: options.snapshotImageId,
+      sessionConfig: {
+        session_id: sessionId,
+        repo_owner: session.repo_owner,
+        repo_name: session.repo_name,
+        provider,
+        model,
+      },
+      sandboxId: expectedSandboxId,
+      controlPlaneUrl,
+      sandboxAuthToken,
+    });
+
+    console.log("Modal sandbox restored:", result);
+
+    // Store Modal's internal object ID for snapshot API calls
+    if (result.modalObjectId) {
+      this.sql.exec(
+        `UPDATE sandbox SET modal_object_id = ? WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
+        result.modalObjectId
+      );
+      console.log(`[DO] Stored modal_object_id: ${result.modalObjectId}`);
+    }
+
+    this.applyPreviewArtifacts(
+      {
+        previewTunnelUrl: result.previewTunnelUrl,
+        tunnelUrls: result.tunnelUrls,
+      },
+      now
+    );
+
+    return {
+      sandbox_id: expectedSandboxId,
+      object_id: result.modalObjectId || "",
+    };
+  }
+
+  /**
+   * Store preview URLs and create preview artifact if available.
+   */
+  private applyPreviewArtifacts(
+    result: { previewTunnelUrl?: string; tunnelUrls?: Record<number, string> },
+    now: number
+  ): void {
     if (result.tunnelUrls) {
       this.sandboxRepo.updateTunnelUrls(JSON.stringify(result.tunnelUrls));
       console.log(`[DO] Stored tunnel_urls: ${Object.keys(result.tunnelUrls).join(", ")}`);
@@ -2884,11 +3015,6 @@ export class SessionDO extends DurableObject<Env> {
         },
       });
     }
-
-    return {
-      sandbox_id: expectedSandboxId,
-      object_id: result.modalObjectId || "",
-    };
   }
 
   /**
@@ -2989,7 +3115,19 @@ export class SessionDO extends DurableObject<Env> {
   private async spawnSandboxIfNeeded(): Promise<void> {
     this.initServices();
     const sandboxWs = this.wsManager!.getSandboxWebSocket();
-    if (!sandboxWs && !this.isSpawningSandbox) {
+    const sandboxReady = sandboxWs && sandboxWs.readyState === WebSocket.OPEN;
+    if (!sandboxReady && !this.isSpawningSandbox) {
+      const sandbox = this.sandboxRepo.get();
+      // If the sandbox was terminated externally, mark stale so we restore/spawn immediately.
+      if (
+        sandbox &&
+        (sandbox.status === "ready" ||
+          sandbox.status === "running" ||
+          sandbox.status === "connecting")
+      ) {
+        this.sandboxManager!.updateStatus("stale");
+        this.broadcast({ type: "sandbox_status", status: "stale" });
+      }
       this.broadcast({ type: "sandbox_spawning" });
       await this.spawnSandbox();
     }

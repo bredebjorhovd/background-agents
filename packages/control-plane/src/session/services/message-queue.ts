@@ -21,6 +21,42 @@ interface MessageQueueDependencies {
 export function createMessageQueue(deps: MessageQueueDependencies): MessageQueue {
   const { messageRepo, participantRepo, getSession, sendToSandbox, spawnIfNeeded } = deps;
 
+  const shouldForceStartPreview = (content: string): boolean => {
+    const trimmed = content.trim().toLowerCase();
+    if (!trimmed) return false;
+    if (trimmed.includes("start-preview")) return true;
+    if (trimmed.startsWith("start preview")) return true;
+    if (trimmed.startsWith("restart preview")) return true;
+    if (trimmed.startsWith("start the preview")) return true;
+    if (trimmed.startsWith("restart the preview")) return true;
+    return (
+      /^(please\s+)?(start|restart|run|launch|open)\b/.test(trimmed) &&
+      /\b(preview|dev server|devserver)\b/.test(trimmed)
+    );
+  };
+
+  const rewriteForStartPreview = (content: string): string => {
+    const lower = content.toLowerCase();
+    const wants5173 = lower.includes("5173");
+    const avoid8080 = lower.includes("8080") && lower.includes("dont");
+    const portHint = wants5173
+      ? "Use port 5173."
+      : "Default to port 5173. Avoid port 8080 unless the user explicitly requests it.";
+    const avoidHint = avoid8080 ? "Do NOT use port 8080." : "";
+
+    return [
+      "You must immediately call the `start-preview` tool for this request.",
+      "Do NOT run bash/run_command to start a dev server.",
+      "Do NOT inspect code or files for this request.",
+      portHint,
+      avoidHint,
+      "",
+      `User request: ${content.trim()}`,
+    ]
+      .filter((line) => line.trim().length > 0)
+      .join("\n");
+  };
+
   return {
     async enqueue(data: {
       content: string;
@@ -74,11 +110,22 @@ export function createMessageQueue(deps: MessageQueueDependencies): MessageQueue
         const session = getSession();
 
         // Build prompt command with model and attachments
+        const forceStartPreview = shouldForceStartPreview(nextMessage.content);
+        const commandContent = forceStartPreview
+          ? rewriteForStartPreview(nextMessage.content)
+          : nextMessage.content;
         const command: PromptCommand = {
           type: "prompt",
           messageId: nextMessage.id,
-          content: nextMessage.content,
+          content: commandContent,
           model: nextMessage.model || session?.model || "claude-haiku-4-5",
+          toolPolicy: forceStartPreview
+            ? {
+                mode: "allowlist",
+                allowedTools: ["start-preview"],
+                reason: "preview",
+              }
+            : undefined,
           author: {
             userId: author?.user_id ?? "unknown",
             githubName: author?.github_name ?? null,

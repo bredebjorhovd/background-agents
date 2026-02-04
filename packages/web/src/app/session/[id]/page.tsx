@@ -490,6 +490,12 @@ function SessionContent({
                 )
               )}
               {isProcessing && <ThinkingIndicator />}
+              {!isProcessing &&
+                (sessionState?.sandboxStatus === "spawning" ||
+                  sessionState?.sandboxStatus === "connecting" ||
+                  sessionState?.sandboxStatus === "warming") && (
+                  <SandboxStartingIndicator status={sessionState?.sandboxStatus} />
+                )}
 
               <div ref={messagesEndRef} />
             </div>
@@ -793,6 +799,21 @@ function ThinkingIndicator() {
     <div className="bg-card p-4 flex items-center gap-2">
       <span className="inline-block w-2 h-2 bg-accent rounded-full animate-pulse" />
       <span className="text-sm text-muted-foreground">Thinking...</span>
+    </div>
+  );
+}
+
+function SandboxStartingIndicator({ status }: { status?: string }) {
+  const message =
+    status === "warming"
+      ? "Warming sandbox..."
+      : status === "connecting"
+        ? "Connecting sandbox..."
+        : "Starting sandbox...";
+  return (
+    <div className="bg-card p-4 flex items-center gap-2">
+      <span className="inline-block w-2 h-2 bg-accent rounded-full animate-pulse" />
+      <span className="text-sm text-muted-foreground">{message}</span>
     </div>
   );
 }

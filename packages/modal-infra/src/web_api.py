@@ -235,6 +235,9 @@ async def api_warm_sandbox(
             "data": {
                 "sandbox_id": handle.sandbox_id,
                 "status": handle.status.value,
+                "modal_object_id": handle.modal_object_id,
+                "preview_tunnel_url": handle.preview_tunnel_url,
+                "tunnel_urls": handle.tunnel_urls,
             },
         }
     except Exception as e:

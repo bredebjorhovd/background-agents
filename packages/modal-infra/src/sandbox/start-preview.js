@@ -136,41 +136,123 @@ function configureFramework(workdir, projectType) {
 
   if (type === "vite" && configFile) {
     const configPath = join(workdir, configFile)
-    let content = readFileSync(configPath, "utf-8")
-
-    // Check if server config already exists
-    if (content.includes("allowedHosts")) {
-      // Already configured
-      return { configured: true, message: "Vite already has allowedHosts configured" }
+    const original = readFileSync(configPath, "utf-8")
+    let content = original
+    const findServerBlock = (text) => {
+      const match = text.match(/server\s*:\s*\{/)
+      if (!match || match.index == null) return null
+      const start = match.index
+      const braceStart = text.indexOf("{", start)
+      if (braceStart === -1) return null
+      let depth = 0
+      let inSingle = false
+      let inDouble = false
+      let inTemplate = false
+      let escaped = false
+      for (let i = braceStart; i < text.length; i += 1) {
+        const ch = text[i]
+        if (escaped) {
+          escaped = false
+          continue
+        }
+        if ((inSingle || inDouble || inTemplate) && ch === "\\") {
+          escaped = true
+          continue
+        }
+        if (!inDouble && !inTemplate && ch === "'" && !inSingle) {
+          inSingle = true
+          continue
+        }
+        if (inSingle && ch === "'") {
+          inSingle = false
+          continue
+        }
+        if (!inSingle && !inTemplate && ch === '"' && !inDouble) {
+          inDouble = true
+          continue
+        }
+        if (inDouble && ch === '"') {
+          inDouble = false
+          continue
+        }
+        if (!inSingle && !inDouble && ch === "`") {
+          inTemplate = !inTemplate
+          continue
+        }
+        if (inSingle || inDouble || inTemplate) {
+          continue
+        }
+        if (ch === "{") {
+          depth += 1
+        } else if (ch === "}") {
+          depth -= 1
+          if (depth === 0) {
+            return { start, end: i }
+          }
+        }
+      }
+      return null
     }
 
-    // Add server config with allowedHosts: true
-    // Handle different config formats
-    if (content.includes("export default defineConfig")) {
-      // defineConfig format
-      if (content.includes("server:")) {
-        // Server block exists, add allowedHosts
-        content = content.replace(
-          /server:\s*\{/,
-          "server: {\n    allowedHosts: true,\n    host: true,"
+    const serverBlockInfo = findServerBlock(content)
+
+    if (serverBlockInfo) {
+      let serverBlock = content.slice(serverBlockInfo.start, serverBlockInfo.end + 1)
+      const baseIndentMatch = serverBlock.match(/(^\s*)server\s*:/m)
+      const baseIndent = baseIndentMatch ? baseIndentMatch[1] : ""
+      const propIndent = baseIndent + "  "
+
+      const hasAllowedHosts = /allowedHosts\s*:/.test(serverBlock)
+      const hasHost = /host\s*:/.test(serverBlock)
+      const hasPort = /port\s*:/.test(serverBlock)
+
+      // Remove duplicate host lines (keep the last occurrence)
+      const hostLineRegex = /^\s*host\s*:\s*[^,\n}]+,?\s*$/gm
+      const hostMatches = Array.from(serverBlock.matchAll(hostLineRegex))
+      if (hostMatches.length > 1) {
+        const lastIndex = hostMatches[hostMatches.length - 1].index
+        serverBlock = serverBlock.replace(hostLineRegex, (line, offset) => {
+          if (offset === lastIndex) return line
+          return ""
+        })
+      }
+
+      const insertLines = []
+      if (!hasAllowedHosts) {
+        insertLines.push(`${propIndent}allowedHosts: true,`)
+      }
+      if (!hasHost) {
+        insertLines.push(`${propIndent}host: true,`)
+      }
+      if (!hasPort) {
+        insertLines.push(`${propIndent}port: ${port},`)
+      }
+      if (insertLines.length > 0) {
+        serverBlock = serverBlock.replace(
+          /server\s*:\s*\{/,
+          (match) => `${match}\n${insertLines.join("\n")}`
         )
-      } else {
-        // No server block, add one
+      }
+
+      if (hasPort) {
+        serverBlock = serverBlock.replace(/(port\s*:\s*)([^,\n}]+)/, `$1${port}`)
+      }
+
+      content =
+        content.slice(0, serverBlockInfo.start) +
+        serverBlock +
+        content.slice(serverBlockInfo.end + 1)
+    } else {
+      // Add server config with allowedHosts: true
+      // Handle different config formats
+      if (content.includes("export default defineConfig")) {
         content = content.replace(
           /defineConfig\(\s*\{/,
           "defineConfig({\n  server: {\n    allowedHosts: true,\n    host: true,\n    port: " +
             port +
             ",\n  },"
         )
-      }
-    } else if (content.includes("export default {")) {
-      // Plain object export
-      if (content.includes("server:")) {
-        content = content.replace(
-          /server:\s*\{/,
-          "server: {\n    allowedHosts: true,\n    host: true,"
-        )
-      } else {
+      } else if (content.includes("export default {")) {
         content = content.replace(
           /export default\s*\{/,
           "export default {\n  server: {\n    allowedHosts: true,\n    host: true,\n    port: " +
@@ -180,8 +262,12 @@ function configureFramework(workdir, projectType) {
       }
     }
 
-    writeFileSync(configPath, content)
-    return { configured: true, message: `Updated ${configFile} with allowedHosts: true` }
+    if (content !== original) {
+      writeFileSync(configPath, content)
+      return { configured: true, message: `Updated ${configFile} with preview server settings` }
+    }
+
+    return { configured: true, message: `${configFile} already configured for preview` }
   }
 
   if (type === "nextjs") {
@@ -299,24 +385,32 @@ function startDevServer(workdir, projectType, extraEnv = {}) {
 /**
  * Wait for the dev server to be ready by polling the port.
  */
-async function waitForServer(port, maxWaitMs = 30000) {
+async function waitForServer(ports, maxWaitMs = 30000) {
+  const portList = Array.isArray(ports) ? ports : [ports]
   const startTime = Date.now()
 
   while (Date.now() - startTime < maxWaitMs) {
-    try {
-      const response = await fetch(`http://localhost:${port}`, {
-        method: "GET",
-        signal: AbortSignal.timeout(2000),
-      })
-      // Any response means server is up
-      return { ready: true, message: `Server is ready on port ${port}` }
-    } catch {
-      // Server not ready yet, wait and retry
-      await new Promise((resolve) => setTimeout(resolve, 1000))
+    for (const port of portList) {
+      try {
+        const response = await fetch(`http://localhost:${port}`, {
+          method: "GET",
+          signal: AbortSignal.timeout(2000),
+        })
+        // Any response means server is up
+        return { ready: true, port, message: `Server is ready on port ${port}` }
+      } catch {
+        // Try next port
+      }
     }
+    // Server not ready yet, wait and retry
+    await new Promise((resolve) => setTimeout(resolve, 1000))
   }
 
-  return { ready: false, message: `Server did not become ready within ${maxWaitMs / 1000}s` }
+  return {
+    ready: false,
+    port: null,
+    message: `Server did not become ready within ${maxWaitMs / 1000}s`,
+  }
 }
 
 /**
@@ -350,7 +444,7 @@ async function getPreviewUrl(sessionId, port) {
 
 export default tool({
   name: "start-preview",
-  description: `Use this tool when the user says "start the dev server", "start the preview", "start the dev server and start the preview", or similar. Do NOT use run_command with "npm run dev" - that blocks until timeout and locks the session.
+  description: `Use this tool when the user says "start the dev server", "start the preview", "start the dev server and start the preview", or similar. Do NOT use run_command with "npm run dev" - that blocks until timeout and locks the session. After calling this tool, do NOT run additional commands to start the server; return the result to the user.
 
 This tool automatically:
 1. Detects your project type (Vite, Next.js, CRA, Angular, Vue, Svelte, Astro)
@@ -375,13 +469,11 @@ Just call this tool and it handles everything - no need to manually configure or
       .describe("Working directory (default: current directory)"),
   },
   async execute({ skipInstall = false, skipConfig = false, workdir }) {
-    const sessionId = getSessionId()
-    if (!sessionId) {
-      return {
-        content: "Failed to start preview: Session ID not found in environment.",
-        success: false,
+    try {
+      const sessionId = getSessionId()
+      if (!sessionId) {
+        return "Failed to start preview: Session ID not found in environment."
       }
-    }
 
     // Determine working directory
     const cwd = workdir || process.cwd()
@@ -397,10 +489,7 @@ Just call this tool and it handles everything - no need to manually configure or
     })
 
     if (!projectType.startCommand) {
-      return {
-        content: `Could not detect how to start this project. No 'dev' or 'start' script found in package.json.\n\nDetected: ${JSON.stringify(projectType, null, 2)}`,
-        success: false,
-      }
+      return `Could not detect how to start this project. No 'dev' or 'start' script found in package.json.\n\nDetected: ${JSON.stringify(projectType, null, 2)}`
     }
 
     // Step 2: Install dependencies
@@ -408,10 +497,7 @@ Just call this tool and it handles everything - no need to manually configure or
       const installResult = installDependencies(cwd, projectType.packageManager)
       steps.push({ step: "install", result: installResult.message })
       if (installResult.error) {
-        return {
-          content: `Failed during dependency installation:\n${steps.map((s) => `- ${s.step}: ${s.result}`).join("\n")}`,
-          success: false,
-        }
+        return `Failed during dependency installation:\n${steps.map((s) => `- ${s.step}: ${s.result}`).join("\n")}`
       }
     } else {
       steps.push({ step: "install", result: "Skipped (skipInstall=true)" })
@@ -433,15 +519,22 @@ Just call this tool and it handles everything - no need to manually configure or
     const startResult = startDevServer(cwd, projectType, extraEnv)
     steps.push({ step: "start", result: startResult.message })
     if (!startResult.started) {
-      return {
-        content: `Failed to start dev server:\n${steps.map((s) => `- ${s.step}: ${s.result}`).join("\n")}`,
-        success: false,
-      }
+      return `Failed to start dev server:\n${steps.map((s) => `- ${s.step}: ${s.result}`).join("\n")}`
     }
 
     // Step 5: Wait for server to be ready
-    const readyResult = await waitForServer(projectType.port)
+    const candidatePorts = Array.from(
+      new Set([projectType.port, 5173, 3000, 8080, 4321, 4200])
+    )
+    const readyResult = await waitForServer(candidatePorts)
     steps.push({ step: "ready", result: readyResult.message })
+    if (readyResult.ready && readyResult.port && readyResult.port !== projectType.port) {
+      steps.push({
+        step: "port",
+        result: `Detected dev server on port ${readyResult.port} (expected ${projectType.port})`,
+      })
+      projectType.port = readyResult.port
+    }
 
     // Step 6: Get preview URL for the specific port
     const { url: previewUrl, availablePorts, error: urlError } = await getPreviewUrl(
@@ -470,12 +563,10 @@ Just call this tool and it handles everything - no need to manually configure or
       .filter(Boolean)
       .join("\n")
 
-    return {
-      content: summary,
-      success: true,
-      previewUrl,
-      port: projectType.port,
-      framework: projectType.framework,
+      return summary
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return `Failed to start preview: ${message}`
     }
   },
 })

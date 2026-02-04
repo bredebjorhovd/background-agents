@@ -360,7 +360,11 @@ class SandboxManager:
             encrypted_ports=PREVIEW_PORTS,
         )
 
-        print(f"[manager] Sandbox restored from snapshot: {sandbox_id} (image={snapshot_image_id})")
+        modal_object_id = sandbox.object_id
+        print(
+            f"[manager] Sandbox restored from snapshot: {sandbox_id} "
+            f"(image={snapshot_image_id}, object_id={modal_object_id})"
+        )
 
         # Get tunnel URLs for restored sandbox
         preview_tunnel_url = None
@@ -384,6 +388,7 @@ class SandboxManager:
             status=SandboxStatus.WARMING,
             created_at=time.time(),
             snapshot_id=snapshot_image_id,
+            modal_object_id=modal_object_id,
             preview_tunnel_url=preview_tunnel_url,
             tunnel_urls=tunnel_urls if tunnel_urls else None,
         )
