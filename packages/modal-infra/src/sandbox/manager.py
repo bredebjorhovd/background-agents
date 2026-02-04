@@ -18,7 +18,12 @@ import modal
 
 from ..app import app, llm_secrets
 from ..images.base import base_image
-from .sandbox_types import SandboxStatus, SessionConfig
+from .log_config import get_logger
+from .types import SandboxStatus, SessionConfig
+
+log = get_logger("manager")
+
+DEFAULT_SANDBOX_TIMEOUT_SECONDS = 7200  # 2 hours
 
 
 @dataclass
@@ -32,8 +37,9 @@ class SandboxConfig:
     session_config: SessionConfig | None = None
     control_plane_url: str = ""
     sandbox_auth_token: str = ""
-    timeout_hours: float = 2.0
+    timeout_seconds: int = DEFAULT_SANDBOX_TIMEOUT_SECONDS
     github_app_token: str | None = None  # GitHub App token for git operations
+    user_env_vars: dict[str, str] | None = None  # User-provided env vars (repo secrets)
 
 
 # Ports for live preview - cover common frameworks
@@ -102,21 +108,30 @@ class SandboxManager:
         Returns:
             SandboxHandle with the running sandbox
         """
+        start_time = time.time()
+
         # Use provided sandbox_id from control plane, or generate one
         if config.sandbox_id:
             sandbox_id = config.sandbox_id
         else:
             sandbox_id = f"sandbox-{config.repo_owner}-{config.repo_name}-{int(time.time() * 1000)}"
 
-        # Prepare environment variables
-        env_vars = {
-            "PYTHONUNBUFFERED": "1",  # Ensure logs are flushed immediately
-            "SANDBOX_ID": sandbox_id,
-            "CONTROL_PLANE_URL": config.control_plane_url,
-            "SANDBOX_AUTH_TOKEN": config.sandbox_auth_token,
-            "REPO_OWNER": config.repo_owner,
-            "REPO_NAME": config.repo_name,
-        }
+        # Prepare environment variables (user vars first, system vars override)
+        env_vars: dict[str, str] = {}
+
+        if config.user_env_vars:
+            env_vars.update(config.user_env_vars)
+
+        env_vars.update(
+            {
+                "PYTHONUNBUFFERED": "1",  # Ensure logs are flushed immediately
+                "SANDBOX_ID": sandbox_id,
+                "CONTROL_PLANE_URL": config.control_plane_url,
+                "SANDBOX_AUTH_TOKEN": config.sandbox_auth_token,
+                "REPO_OWNER": config.repo_owner,
+                "REPO_NAME": config.repo_name,
+            }
+        )
 
         # Add GitHub App token if available (for git sync operations)
         if config.github_app_token:
@@ -141,7 +156,7 @@ class SandboxManager:
             image=image,
             app=app,
             secrets=[llm_secrets],
-            timeout=int(config.timeout_hours * 3600),
+            timeout=config.timeout_seconds,
             workdir="/workspace",
             env=env_vars,
             encrypted_ports=PREVIEW_PORTS,
@@ -150,8 +165,15 @@ class SandboxManager:
 
         # Get Modal's internal object ID for API calls (snapshot, etc.)
         modal_object_id = sandbox.object_id
-        print(
-            f"[manager] Created sandbox: sandbox_id={sandbox_id}, modal_object_id={modal_object_id}"
+        duration_ms = int((time.time() - start_time) * 1000)
+        log.info(
+            "sandbox.create",
+            sandbox_id=sandbox_id,
+            modal_object_id=modal_object_id,
+            repo_owner=config.repo_owner,
+            repo_name=config.repo_name,
+            duration_ms=duration_ms,
+            outcome="success",
         )
 
         # Get tunnel URLs for all exposed ports (retry - tunnels may not be ready immediately)
@@ -249,6 +271,7 @@ class SandboxManager:
         Returns:
             Image ID that can be used to restore the sandbox later
         """
+        start_time = time.time()
         snapshot_id = f"snap-{handle.sandbox_id}-{int(time.time() * 1000)}"
 
         # Use Modal's native snapshot_filesystem() API
@@ -259,7 +282,15 @@ class SandboxManager:
         # Modal automatically stores the image and it persists indefinitely
         image_id = image.object_id
 
-        print(f"[manager] Snapshot taken: {snapshot_id} -> image_id={image_id}")
+        duration_ms = int((time.time() - start_time) * 1000)
+        log.info(
+            "sandbox.snapshot",
+            sandbox_id=handle.sandbox_id,
+            snapshot_id=snapshot_id,
+            image_id=image_id,
+            duration_ms=duration_ms,
+            outcome="success",
+        )
 
         return image_id
 
@@ -284,7 +315,7 @@ class SandboxManager:
                 created_at=time.time(),
             )
         except Exception as e:
-            print(f"[manager] Failed to get sandbox {sandbox_id}: {e}")
+            log.warn("sandbox.lookup_error", sandbox_id=sandbox_id, exc=e)
             return None
 
     async def restore_from_snapshot(
@@ -294,6 +325,9 @@ class SandboxManager:
         sandbox_id: str | None = None,
         control_plane_url: str = "",
         sandbox_auth_token: str = "",
+        github_app_token: str | None = None,
+        user_env_vars: dict[str, str] | None = None,
+        timeout_seconds: int = DEFAULT_SANDBOX_TIMEOUT_SECONDS,
     ) -> SandboxHandle:
         """
         Create a new sandbox from a filesystem snapshot Image.
@@ -311,6 +345,8 @@ class SandboxManager:
         Returns:
             SandboxHandle for the restored sandbox
         """
+        start_time = time.time()
+
         # Handle both SessionConfig and dict
         if isinstance(session_config, dict):
             repo_owner = session_config.get("repo_owner", "")
@@ -332,25 +368,35 @@ class SandboxManager:
         # Lookup the image by ID
         image = modal.Image.from_id(snapshot_image_id)
 
-        # Prepare environment variables
-        env_vars = {
-            "PYTHONUNBUFFERED": "1",
-            "SANDBOX_ID": sandbox_id,
-            "CONTROL_PLANE_URL": control_plane_url,
-            "SANDBOX_AUTH_TOKEN": sandbox_auth_token,
-            "REPO_OWNER": repo_owner,
-            "REPO_NAME": repo_name,
-            "RESTORED_FROM_SNAPSHOT": "true",  # Signal to skip git clone
-            "SESSION_CONFIG": json.dumps(
-                {
-                    "session_id": session_id,
-                    "repo_owner": repo_owner,
-                    "repo_name": repo_name,
-                    "provider": provider,
-                    "model": model,
-                }
-            ),
-        }
+        # Prepare environment variables (user vars first, system vars override)
+        env_vars: dict[str, str] = {}
+
+        if user_env_vars:
+            env_vars.update(user_env_vars)
+
+        env_vars.update(
+            {
+                "PYTHONUNBUFFERED": "1",
+                "SANDBOX_ID": sandbox_id,
+                "CONTROL_PLANE_URL": control_plane_url,
+                "SANDBOX_AUTH_TOKEN": sandbox_auth_token,
+                "REPO_OWNER": repo_owner,
+                "REPO_NAME": repo_name,
+                "RESTORED_FROM_SNAPSHOT": "true",  # Signal to skip git clone
+                "SESSION_CONFIG": json.dumps(
+                    {
+                        "session_id": session_id,
+                        "repo_owner": repo_owner,
+                        "repo_name": repo_name,
+                        "provider": provider,
+                        "model": model,
+                    }
+                ),
+            }
+        )
+
+        if github_app_token:
+            env_vars["GITHUB_APP_TOKEN"] = github_app_token
 
         # Create the sandbox from the snapshot image with encrypted ports for previews
         sandbox = modal.Sandbox.create(
@@ -360,42 +406,25 @@ class SandboxManager:
             image=image,  # Use the snapshot image directly
             app=app,
             secrets=[llm_secrets],
-            timeout=2 * 3600,  # 2 hours
+            timeout=timeout_seconds,
             workdir="/workspace",
             env=env_vars,
             encrypted_ports=PREVIEW_PORTS,
         )
 
         modal_object_id = sandbox.object_id
-        print(
-            f"[manager] Sandbox restored from snapshot: {sandbox_id} "
-            f"(image={snapshot_image_id}, object_id={modal_object_id})"
-        )
 
-        # Get tunnel URLs for restored sandbox (retry - tunnels may not be ready immediately)
-        preview_tunnel_url = None
-        tunnel_urls: dict[int, str] = {}
-        for attempt in range(3):
-            try:
-                tunnels = sandbox.tunnels(timeout=60)
-                for port in PREVIEW_PORTS:
-                    if port in tunnels:
-                        tunnel_urls[port] = tunnels[port].url
-                if PREVIEW_PORT in tunnel_urls:
-                    preview_tunnel_url = tunnel_urls[PREVIEW_PORT]
-                elif tunnel_urls:
-                    preview_tunnel_url = next(iter(tunnel_urls.values()))
-                if tunnel_urls:
-                    print(f"[manager] Restored sandbox tunnel ports: {list(tunnel_urls.keys())}")
-                    break
-            except Exception as e:
-                print(f"[manager] Restore tunnel fetch attempt {attempt + 1}/3 failed: {e}")
-                if attempt < 2:
-                    time.sleep(5)
-        if not tunnel_urls:
-            print(
-                "[manager] WARNING: No tunnel URLs for restored sandbox - preview links will not work"
-            )
+        duration_ms = int((time.time() - start_time) * 1000)
+        log.info(
+            "sandbox.restore",
+            sandbox_id=sandbox_id,
+            modal_object_id=modal_object_id,
+            snapshot_image_id=snapshot_image_id,
+            repo_owner=repo_owner,
+            repo_name=repo_name,
+            duration_ms=duration_ms,
+            outcome="success",
+        )
 
         return SandboxHandle(
             sandbox_id=sandbox_id,
@@ -404,8 +433,6 @@ class SandboxManager:
             created_at=time.time(),
             snapshot_id=snapshot_image_id,
             modal_object_id=modal_object_id,
-            preview_tunnel_url=preview_tunnel_url,
-            tunnel_urls=tunnel_urls if tunnel_urls else None,
         )
 
     async def maintain_warm_pool(

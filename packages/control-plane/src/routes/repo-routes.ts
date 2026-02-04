@@ -10,8 +10,11 @@ import type {
   InstallationRepository,
   RepoMetadata,
 } from "@open-inspect/shared";
-import { getRepoMetadataKey } from "../utils/repo";
 import { json, error } from "./helpers";
+
+function getRepoMetadataKey(owner: string, name: string): string {
+  return `repo:metadata:${owner.toLowerCase()}/${name.toLowerCase()}`;
+}
 
 /**
  * Cached repos list structure.

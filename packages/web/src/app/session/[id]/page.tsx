@@ -213,6 +213,13 @@ export default function SessionPage() {
     prevPreviewUrlRef.current = currentUrl;
   }, [previewArtifact?.url, prompt]);
 
+  // Sync selectedModel with session's model when session state loads
+  useEffect(() => {
+    if (sessionState?.model) {
+      setSelectedModel(sessionState.model);
+    }
+  }, [sessionState?.model]);
+
   // Scroll to bottom when new content arrives
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -882,6 +889,7 @@ function EventItem({
     args?: Record<string, unknown>;
     result?: string;
     error?: string;
+    success?: boolean;
     status?: string;
     timestamp: number;
     author?: {
@@ -969,6 +977,15 @@ function EventItem({
       );
 
     case "execution_complete":
+      if (event.success === false) {
+        return (
+          <div className="flex items-center gap-2 text-sm text-red-600 dark:text-red-400">
+            <span className="w-2 h-2 rounded-full bg-red-500" />
+            Execution failed{event.error ? `: ${event.error}` : ""}
+            <span className="text-xs text-secondary-foreground">{time}</span>
+          </div>
+        );
+      }
       return (
         <div className="flex items-center gap-2 text-sm text-success">
           <span className="w-2 h-2 rounded-full bg-success" />

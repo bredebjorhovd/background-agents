@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.sandbox.bridge import AgentBridge
+from src.sandbox.bridge import AgentBridge, OpenCodeIdentifier
 from tests.conftest import MockResponse
 
 
@@ -61,7 +61,7 @@ class MockHttpClient:
         self._get_call_count += 1
         if self.get_responses:
             return self.get_responses.pop(0)
-        return MockResponse(200, {})
+        return MockResponse(200, [])
 
     def stream(self, method: str, url: str, timeout: Any = None):
         """Return a context manager for SSE streaming."""
@@ -86,6 +86,17 @@ def bridge() -> AgentBridge:
     bridge.opencode_session_id = "oc-session-123"
     bridge.http_client = MockHttpClient()
     return bridge
+
+
+@pytest.fixture
+def opencode_message_id(monkeypatch) -> str:
+    message_id = "msg_test"
+    monkeypatch.setattr(
+        OpenCodeIdentifier,
+        "ascending",
+        classmethod(lambda cls, prefix: message_id),
+    )
+    return message_id
 
 
 class TestSSEParser:
@@ -116,7 +127,7 @@ class TestSSEParser:
                         "type": "text",
                         "id": "part-1",
                         "sessionID": "oc-session-123",
-                        "messageID": "msg-1",
+                        "messageID": "oc-msg-1",
                         "text": "Hello",
                     }
                 },
@@ -156,7 +167,7 @@ class TestSSEStreaming:
     """Tests for _stream_opencode_response_sse method."""
 
     @pytest.mark.asyncio
-    async def test_text_streaming_with_delta(self, bridge: AgentBridge):
+    async def test_text_streaming_with_delta(self, bridge: AgentBridge, opencode_message_id: str):
         """Should accumulate text deltas correctly."""
         http_client = bridge.http_client
 
@@ -164,13 +175,24 @@ class TestSSEStreaming:
         http_client.sse_events = [
             create_sse_event("server.connected", {}),
             create_sse_event(
+                "message.updated",
+                {
+                    "info": {
+                        "id": "oc-msg-1",
+                        "role": "assistant",
+                        "sessionID": "oc-session-123",
+                        "parentID": opencode_message_id,
+                    }
+                },
+            ),
+            create_sse_event(
                 "message.part.updated",
                 {
                     "part": {
                         "type": "text",
                         "id": "part-1",
                         "sessionID": "oc-session-123",
-                        "messageID": "msg-1",
+                        "messageID": "oc-msg-1",
                         "text": "Hello",
                     },
                     "delta": "Hello",
@@ -183,7 +205,7 @@ class TestSSEStreaming:
                         "type": "text",
                         "id": "part-1",
                         "sessionID": "oc-session-123",
-                        "messageID": "msg-1",
+                        "messageID": "oc-msg-1",
                         "text": "Hello world",
                     },
                     "delta": " world",
@@ -203,12 +225,25 @@ class TestSSEStreaming:
         assert token_events[1]["content"] == "Hello world"  # Cumulative
 
     @pytest.mark.asyncio
-    async def test_text_streaming_without_delta(self, bridge: AgentBridge):
+    async def test_text_streaming_without_delta(
+        self, bridge: AgentBridge, opencode_message_id: str
+    ):
         """Should handle full text updates without delta field."""
         http_client = bridge.http_client
 
         http_client.sse_events = [
             create_sse_event("server.connected", {}),
+            create_sse_event(
+                "message.updated",
+                {
+                    "info": {
+                        "id": "oc-msg-1",
+                        "role": "assistant",
+                        "sessionID": "oc-session-123",
+                        "parentID": opencode_message_id,
+                    }
+                },
+            ),
             create_sse_event(
                 "message.part.updated",
                 {
@@ -216,7 +251,7 @@ class TestSSEStreaming:
                         "type": "text",
                         "id": "part-1",
                         "sessionID": "oc-session-123",
-                        "messageID": "msg-1",
+                        "messageID": "oc-msg-1",
                         "text": "Full text content",
                     }
                 },
@@ -233,8 +268,10 @@ class TestSSEStreaming:
         assert token_events[0]["content"] == "Full text content"
 
     @pytest.mark.asyncio
-    async def test_tool_events(self, bridge: AgentBridge):
-        """Should emit tool events correctly."""
+    async def test_buffers_parts_until_message_updated(
+        self, bridge: AgentBridge, opencode_message_id: str
+    ):
+        """Should buffer parts until message.updated authorizes them."""
         http_client = bridge.http_client
 
         http_client.sse_events = [
@@ -243,10 +280,62 @@ class TestSSEStreaming:
                 "message.part.updated",
                 {
                     "part": {
+                        "type": "text",
+                        "id": "part-1",
+                        "sessionID": "oc-session-123",
+                        "messageID": "oc-msg-1",
+                        "text": "Hello",
+                    }
+                },
+            ),
+            create_sse_event(
+                "message.updated",
+                {
+                    "info": {
+                        "id": "oc-msg-1",
+                        "role": "assistant",
+                        "sessionID": "oc-session-123",
+                        "parentID": opencode_message_id,
+                    }
+                },
+            ),
+            create_sse_event("session.idle", {"sessionID": "oc-session-123"}),
+        ]
+
+        events = []
+        async for event in bridge._stream_opencode_response_sse("cp-msg-1", "Test prompt"):
+            events.append(event)
+
+        token_events = [e for e in events if e["type"] == "token"]
+        assert len(token_events) == 1
+        assert token_events[0]["content"] == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_tool_events(self, bridge: AgentBridge, opencode_message_id: str):
+        """Should emit tool events correctly."""
+        http_client = bridge.http_client
+
+        http_client.sse_events = [
+            create_sse_event("server.connected", {}),
+            create_sse_event(
+                "message.updated",
+                {
+                    "info": {
+                        "id": "oc-msg-1",
+                        "role": "assistant",
+                        "sessionID": "oc-session-123",
+                        "parentID": opencode_message_id,
+                    }
+                },
+            ),
+            create_sse_event(
+                "message.part.updated",
+                {
+                    "part": {
                         "type": "tool",
                         "id": "part-1",
                         "sessionID": "oc-session-123",
-                        "messageID": "msg-1",
+                        "messageID": "oc-msg-1",
                         "tool": "Bash",
                         "callID": "call-1",
                         "state": {
@@ -264,7 +353,7 @@ class TestSSEStreaming:
                         "type": "tool",
                         "id": "part-1",
                         "sessionID": "oc-session-123",
-                        "messageID": "msg-1",
+                        "messageID": "oc-msg-1",
                         "tool": "Bash",
                         "callID": "call-1",
                         "state": {
@@ -288,12 +377,23 @@ class TestSSEStreaming:
         assert tool_events[1]["status"] == "completed"
 
     @pytest.mark.asyncio
-    async def test_filters_other_sessions(self, bridge: AgentBridge):
+    async def test_filters_other_sessions(self, bridge: AgentBridge, opencode_message_id: str):
         """Should filter out events from other sessions."""
         http_client = bridge.http_client
 
         http_client.sse_events = [
             create_sse_event("server.connected", {}),
+            create_sse_event(
+                "message.updated",
+                {
+                    "info": {
+                        "id": "oc-msg-1",
+                        "role": "assistant",
+                        "sessionID": "oc-session-123",
+                        "parentID": opencode_message_id,
+                    }
+                },
+            ),
             # Event from our session
             create_sse_event(
                 "message.part.updated",
@@ -302,7 +402,7 @@ class TestSSEStreaming:
                         "type": "text",
                         "id": "part-1",
                         "sessionID": "oc-session-123",
-                        "messageID": "msg-1",
+                        "messageID": "oc-msg-1",
                         "text": "Our response",
                     }
                 },
@@ -332,12 +432,25 @@ class TestSSEStreaming:
         assert token_events[0]["content"] == "Our response"
 
     @pytest.mark.asyncio
-    async def test_completion_on_session_status_idle(self, bridge: AgentBridge):
+    async def test_completion_on_session_status_idle(
+        self, bridge: AgentBridge, opencode_message_id: str
+    ):
         """Should complete on session.status with type=idle."""
         http_client = bridge.http_client
 
         http_client.sse_events = [
             create_sse_event("server.connected", {}),
+            create_sse_event(
+                "message.updated",
+                {
+                    "info": {
+                        "id": "oc-msg-1",
+                        "role": "assistant",
+                        "sessionID": "oc-session-123",
+                        "parentID": opencode_message_id,
+                    }
+                },
+            ),
             create_sse_event(
                 "message.part.updated",
                 {
@@ -345,7 +458,7 @@ class TestSSEStreaming:
                         "type": "text",
                         "id": "part-1",
                         "sessionID": "oc-session-123",
-                        "messageID": "msg-1",
+                        "messageID": "oc-msg-1",
                         "text": "Response",
                     }
                 },
@@ -388,12 +501,25 @@ class TestSSEStreaming:
         assert events[0]["error"] == "Something went wrong"
 
     @pytest.mark.asyncio
-    async def test_message_id_comes_from_control_plane(self, bridge: AgentBridge):
+    async def test_message_id_comes_from_control_plane(
+        self, bridge: AgentBridge, opencode_message_id: str
+    ):
         """All events should use control plane's messageId."""
         http_client = bridge.http_client
 
         http_client.sse_events = [
             create_sse_event("server.connected", {}),
+            create_sse_event(
+                "message.updated",
+                {
+                    "info": {
+                        "id": "oc-msg-1",
+                        "role": "assistant",
+                        "sessionID": "oc-session-123",
+                        "parentID": opencode_message_id,
+                    }
+                },
+            ),
             create_sse_event(
                 "message.part.updated",
                 {
@@ -401,7 +527,7 @@ class TestSSEStreaming:
                         "type": "text",
                         "id": "part-1",
                         "sessionID": "oc-session-123",
-                        "messageID": "oc-internal-msg-id",  # OpenCode's internal ID
+                        "messageID": "oc-msg-1",
                         "text": "Response",
                     }
                 },
@@ -602,14 +728,20 @@ class TestSSEFollowUpMessageBug:
     2. Second prompt asks "who was it by?"
     3. Bug: Second prompt would show first prompt's response
 
-    The fix uses parentID-based correlation: we pass our message_id to OpenCode,
-    and filter based on assistant messages whose parentID matches our message_id.
+    The fix uses parentID-based correlation: we pass an OpenCode-compatible message ID,
+    and filter based on assistant messages whose parentID matches that ID.
     """
 
     @pytest.mark.asyncio
-    async def test_second_prompt_shows_correct_response(self, bridge: AgentBridge):
+    async def test_second_prompt_shows_correct_response(self, bridge: AgentBridge, monkeypatch):
         """Second prompt should show its own response, not the first prompt's."""
         http_client = bridge.http_client
+
+        monkeypatch.setattr(
+            OpenCodeIdentifier,
+            "ascending",
+            classmethod(lambda cls, prefix: "msg_test_1"),
+        )
 
         # First prompt - SSE events (with message.updated for parentID correlation)
         http_client.sse_events = [
@@ -622,7 +754,7 @@ class TestSSEFollowUpMessageBug:
                         "id": "oc-msg-1",
                         "role": "assistant",
                         "sessionID": "oc-session-123",
-                        "parentID": "cp-msg-1",  # Points to our user message
+                        "parentID": "msg_test_1",
                     }
                 },
             ),
@@ -650,7 +782,7 @@ class TestSSEFollowUpMessageBug:
                         "info": {
                             "id": "oc-msg-1",
                             "role": "assistant",
-                            "parentID": "cp-msg-1",
+                            "parentID": "msg_test_1",
                         },
                         "parts": [
                             {
@@ -677,6 +809,11 @@ class TestSSEFollowUpMessageBug:
         assert "073d4e7" in token_events1[-1]["content"]
 
         # Now second prompt - SSE events (with message.updated for parentID correlation)
+        monkeypatch.setattr(
+            OpenCodeIdentifier,
+            "ascending",
+            classmethod(lambda cls, prefix: "msg_test_2"),
+        )
         http_client.sse_events = [
             create_sse_event("server.connected", {}),
             # message.updated provides parentID for correlation
@@ -687,7 +824,7 @@ class TestSSEFollowUpMessageBug:
                         "id": "oc-msg-2",
                         "role": "assistant",
                         "sessionID": "oc-session-123",
-                        "parentID": "cp-msg-2",  # Points to our user message
+                        "parentID": "msg_test_2",
                     }
                 },
             ),
@@ -715,7 +852,7 @@ class TestSSEFollowUpMessageBug:
                         "info": {
                             "id": "oc-msg-1",
                             "role": "assistant",
-                            "parentID": "cp-msg-1",  # First prompt's message
+                            "parentID": "msg_test_1",
                         },
                         "parts": [
                             {
@@ -729,7 +866,7 @@ class TestSSEFollowUpMessageBug:
                         "info": {
                             "id": "oc-msg-2",
                             "role": "assistant",
-                            "parentID": "cp-msg-2",  # Second prompt's message
+                            "parentID": "msg_test_2",
                         },
                         "parts": [
                             {"id": "part-2", "type": "text", "text": "The commit was by Test User"}
@@ -753,6 +890,275 @@ class TestSSEFollowUpMessageBug:
         assert "Test User" in last_token["content"]
         assert "073d4e7" not in last_token["content"]
         assert last_token["messageId"] == "cp-msg-2"
+
+
+class DelayedMockSSEResponse:
+    """Mock SSE response with configurable delays between chunks."""
+
+    def __init__(self, events_with_delays: list[tuple[str, float]], status_code: int = 200):
+        """Each item is (event_text, delay_before_yielding)."""
+        self.status_code = status_code
+        self._events_with_delays = events_with_delays
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        for event, delay in self._events_with_delays:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            yield event
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+
+class HangingMockSSEResponse:
+    """Mock SSE response that hangs forever after initial events."""
+
+    def __init__(self, initial_events: list[str], status_code: int = 200):
+        self.status_code = status_code
+        self._initial_events = initial_events
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        for event in self._initial_events:
+            yield event
+            await asyncio.sleep(0)
+        # Hang forever (will be interrupted by timeout)
+        await asyncio.sleep(3600)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+
+class DelayedMockHttpClient:
+    """Mock HTTP client that uses delayed/hanging SSE responses."""
+
+    def __init__(self, sse_response):
+        self.post_responses: list[Any] = []
+        self.get_responses: list[Any] = []
+        self._sse_response = sse_response
+        self.post_urls: list[str] = []
+        self.get_urls: list[str] = []
+        self._post_call_count = 0
+        self._get_call_count = 0
+
+    async def post(self, url: str, json: dict | None = None, timeout: float = 30.0) -> Any:
+        self._post_call_count += 1
+        self.post_urls.append(url)
+        if self.post_responses:
+            return self.post_responses.pop(0)
+        return MockResponse(204)
+
+    async def get(self, url: str, timeout: float = 10.0) -> Any:
+        self._get_call_count += 1
+        self.get_urls.append(url)
+        if self.get_responses:
+            return self.get_responses.pop(0)
+        return MockResponse(200, [])
+
+    def stream(self, method: str, url: str, timeout: Any = None):
+        return self._sse_response
+
+
+class TestInactivityTimeout:
+    """Tests for SSE inactivity timeout behavior."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_on_no_data(self):
+        """Should raise RuntimeError when SSE stream hangs after connection."""
+        bridge = AgentBridge(
+            sandbox_id="test-sandbox",
+            session_id="test-session",
+            control_plane_url="http://localhost:8787",
+            auth_token="test-token",
+        )
+        bridge.opencode_session_id = "oc-session-123"
+        bridge.sse_inactivity_timeout = 0.2
+
+        # SSE connects but then hangs after server.connected
+        sse_response = HangingMockSSEResponse(
+            initial_events=[create_sse_event("server.connected", {})]
+        )
+        bridge.http_client = DelayedMockHttpClient(sse_response)
+
+        with pytest.raises(RuntimeError, match="SSE stream inactive"):
+            async for _event in bridge._stream_opencode_response_sse("msg-1", "test"):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_timeout_resets_on_data(self, opencode_message_id: str):
+        """Events spaced under the timeout window should complete successfully."""
+        bridge = AgentBridge(
+            sandbox_id="test-sandbox",
+            session_id="test-session",
+            control_plane_url="http://localhost:8787",
+            auth_token="test-token",
+        )
+        bridge.opencode_session_id = "oc-session-123"
+        bridge.sse_inactivity_timeout = 0.5
+
+        # Events arrive every 0.1s — well under the 0.5s inactivity limit
+        # Total wall-clock time (~0.3s) would NOT matter; only gaps between chunks
+        sse_response = DelayedMockSSEResponse(
+            [
+                (create_sse_event("server.connected", {}), 0),
+                (
+                    create_sse_event(
+                        "message.updated",
+                        {
+                            "info": {
+                                "id": "oc-msg-1",
+                                "role": "assistant",
+                                "sessionID": "oc-session-123",
+                                "parentID": opencode_message_id,
+                            }
+                        },
+                    ),
+                    0,
+                ),
+                (
+                    create_sse_event(
+                        "message.part.updated",
+                        {
+                            "part": {
+                                "type": "text",
+                                "id": "part-1",
+                                "sessionID": "oc-session-123",
+                                "messageID": "oc-msg-1",
+                                "text": "Hello",
+                            }
+                        },
+                    ),
+                    0.1,
+                ),
+                (
+                    create_sse_event(
+                        "message.part.updated",
+                        {
+                            "part": {
+                                "type": "text",
+                                "id": "part-1",
+                                "sessionID": "oc-session-123",
+                                "messageID": "oc-msg-1",
+                                "text": "Hello world",
+                            }
+                        },
+                    ),
+                    0.1,
+                ),
+                (create_sse_event("session.idle", {"sessionID": "oc-session-123"}), 0.1),
+            ]
+        )
+        bridge.http_client = DelayedMockHttpClient(sse_response)
+
+        events = []
+        async for event in bridge._stream_opencode_response_sse("msg-1", "test"):
+            events.append(event)
+
+        token_events = [e for e in events if e["type"] == "token"]
+        assert len(token_events) == 2
+        assert token_events[-1]["content"] == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_resets_timeout(self, opencode_message_id: str):
+        """server.heartbeat events should keep the session alive."""
+        bridge = AgentBridge(
+            sandbox_id="test-sandbox",
+            session_id="test-session",
+            control_plane_url="http://localhost:8787",
+            auth_token="test-token",
+        )
+        bridge.opencode_session_id = "oc-session-123"
+        bridge.sse_inactivity_timeout = 0.3
+
+        # Heartbeats arrive every 0.2s — under the 0.3s inactivity limit
+        # Without heartbeats, the 0.2s gaps would eventually accumulate beyond
+        # a wall-clock limit, but since each chunk resets the deadline, this works
+        sse_response = DelayedMockSSEResponse(
+            [
+                (create_sse_event("server.connected", {}), 0),
+                (create_sse_event("server.heartbeat", {}), 0.2),
+                (create_sse_event("server.heartbeat", {}), 0.2),
+                (
+                    create_sse_event(
+                        "message.updated",
+                        {
+                            "info": {
+                                "id": "oc-msg-1",
+                                "role": "assistant",
+                                "sessionID": "oc-session-123",
+                                "parentID": opencode_message_id,
+                            }
+                        },
+                    ),
+                    0,
+                ),
+                (
+                    create_sse_event(
+                        "message.part.updated",
+                        {
+                            "part": {
+                                "type": "text",
+                                "id": "part-1",
+                                "sessionID": "oc-session-123",
+                                "messageID": "oc-msg-1",
+                                "text": "Finally!",
+                            }
+                        },
+                    ),
+                    0.2,
+                ),
+                (create_sse_event("session.idle", {"sessionID": "oc-session-123"}), 0),
+            ]
+        )
+        bridge.http_client = DelayedMockHttpClient(sse_response)
+
+        events = []
+        async for event in bridge._stream_opencode_response_sse("msg-1", "test"):
+            events.append(event)
+
+        token_events = [e for e in events if e["type"] == "token"]
+        assert len(token_events) == 1
+        assert token_events[0]["content"] == "Finally!"
+
+
+class TestPromptMaxDuration:
+    """Tests for prompt max duration timeout behavior."""
+
+    @pytest.mark.asyncio
+    async def test_prompt_max_duration_timeout(self):
+        """Prompt should stop when it exceeds max duration."""
+        bridge = AgentBridge(
+            sandbox_id="test-sandbox",
+            session_id="test-session",
+            control_plane_url="http://localhost:8787",
+            auth_token="test-token",
+        )
+        bridge.opencode_session_id = "oc-session-123"
+        bridge.sse_inactivity_timeout = 2.0
+        bridge.PROMPT_MAX_DURATION = 0.25
+
+        sse_response = DelayedMockSSEResponse(
+            [
+                (create_sse_event("server.connected", {}), 0),
+                (create_sse_event("server.heartbeat", {}), 0.2),
+                (create_sse_event("server.heartbeat", {}), 0.2),
+            ]
+        )
+        http_client = DelayedMockHttpClient(sse_response)
+        http_client.get_responses = [MockResponse(200, [])]
+        bridge.http_client = http_client
+
+        with pytest.raises(RuntimeError, match="Prompt exceeded max duration"):
+            async for _event in bridge._stream_opencode_response_sse("msg-1", "test"):
+                pass
+
+        assert any(url.endswith("/stop") for url in http_client.post_urls)
+        assert any(url.endswith("/message") for url in http_client.get_urls)
 
 
 if __name__ == "__main__":

@@ -78,7 +78,8 @@ Tell the user:
 - **Workers Subdomain**: Workers & Pages → Overview, **bottom-right** panel shows
   `*.YOUR-SUBDOMAIN.workers.dev`
 - **API Token**: Create at https://dash.cloudflare.com/profile/api-tokens with template "Edit
-  Cloudflare Workers" + permissions for Workers KV Storage (Edit), Workers R2 Storage (Edit)
+  Cloudflare Workers" + permissions for Workers KV Storage (Edit), Workers R2 Storage (Edit), D1
+  (Edit)
 
 ### R2 Bucket
 
@@ -144,7 +145,8 @@ cat /tmp/github-app-key-pkcs8.pem
 Guide user:
 
 1. https://api.slack.com/apps → "Create New App" → "From scratch"
-2. OAuth & Permissions → Add scopes: `app_mentions:read`, `chat:write`, `channels:history`
+2. OAuth & Permissions → Add scopes: `app_mentions:read`, `chat:write`, `channels:history`,
+   `channels:read`, `groups:history`, `groups:read`
 3. Install to Workspace, note **Bot Token** (`xoxb-...`)
 4. Basic Information → note **Signing Secret**
 5. **App Home and Event Subscriptions configured AFTER deployment** (worker must be running for URL
@@ -154,6 +156,7 @@ Guide user:
 
 ```bash
 echo "token_encryption_key: $(openssl rand -base64 32)"
+echo "repo_secrets_encryption_key: $(openssl rand -base64 32)"
 echo "internal_callback_secret: $(openssl rand -base64 32)"
 echo "nextauth_secret: $(openssl rand -base64 32)"
 echo "modal_api_secret: $(openssl rand -hex 32)"

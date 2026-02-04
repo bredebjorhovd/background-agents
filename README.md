@@ -1,11 +1,11 @@
-# Open-Inspect
+# Background Agents: Open-Inspect
 
-An open-source background coding agent system inspired by
+An open-source background agents coding system inspired by
 [Ramp's Inspect](https://builders.ramp.com/post/why-we-built-our-background-agent).
 
 ## Overview
 
-Open-Inspect provides a hosted coding agent that can:
+Open-Inspect provides a hosted background coding agent that can:
 
 - Work on tasks in the background while you focus on other things
 - Access full development environments with all tools engineers have
@@ -80,6 +80,9 @@ built for internal use where all employees are trusted and have access to compan
 │  │  │ SQLite  │  │WebSocket│  │  Event  │  │   GitHub      │   │  │
 │  │  │   DB    │  │   Hub   │  │ Stream  │  │ Integration   │   │  │
 │  │  └─────────┘  └─────────┘  └─────────┘  └───────────────┘   │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │              D1 Database (repo-scoped secrets)                │  │
 │  └──────────────────────────────────────────────────────────────┘  │
 └────────────────────────────────┬───────────────────────────────────┘
                                  │

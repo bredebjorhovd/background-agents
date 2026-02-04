@@ -9,40 +9,29 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { initSchema } from "./schema";
-import { generateId, decryptToken, hashToken } from "../auth/crypto";
-import { generateInstallationToken, getGitHubAppConfig } from "../auth/github-app";
+import { generateId, decryptToken, encryptToken, hashToken } from "../auth/crypto";
+import {
+  generateInstallationToken,
+  getGitHubAppConfig,
+  getInstallationRepository,
+} from "../auth/github-app";
+import { refreshAccessToken } from "../auth/github";
 import { createModalClient } from "../sandbox/client";
-import { getIssue } from "../linear/client";
-import { getRepository } from "../auth/pr";
-import { generateBranchName, generateInternalToken } from "@open-inspect/shared";
+import { createModalProvider } from "../sandbox/providers/modal-provider";
+import { createLogger, parseLogLevel } from "../logger";
+import type { Logger } from "../logger";
 import {
-  createMessageRepository,
-  createSessionRepository,
-  createParticipantRepository,
-  createEventRepository,
-  createArtifactRepository,
-  createSandboxRepository,
-  type MessageRepository,
-  type SessionRepository,
-  type ParticipantRepository,
-  type EventRepository,
-  type ArtifactRepository,
-  type SandboxRepository,
-} from "./repository";
-import {
-  createWebSocketManager,
-  createPresenceManager,
-  createEventProcessor,
-  createSandboxManager,
-  createMessageQueue,
-  createPRCreator,
+  SandboxLifecycleManager,
+  DEFAULT_LIFECYCLE_CONFIG,
+  type SandboxStorage,
+  type SandboxBroadcaster,
   type WebSocketManager,
-  type PresenceManager,
-  type EventProcessor,
-  type SandboxManager,
-  type MessageQueue,
-  type PRCreator,
-} from "./services";
+  type AlarmScheduler,
+  type IdGenerator,
+} from "../sandbox/lifecycle/manager";
+import { createPullRequest, getRepository } from "../auth/pr";
+import { generateBranchName } from "@open-inspect/shared";
+import { DEFAULT_MODEL, isValidModel, extractProviderAndModel } from "../utils/models";
 import type {
   Env,
   ClientInfo,
@@ -50,24 +39,13 @@ import type {
   ServerMessage,
   SandboxEvent,
   SessionState,
+  SandboxStatus,
+  MessageSource,
+  ParticipantRole,
 } from "../types";
-import type {
-  SessionRow,
-  ParticipantRow,
-  MessageRow,
-  EventRow,
-  SandboxRow,
-  PromptCommand,
-} from "./types";
-
-/**
- * Message row with joined participant info for author attribution.
- */
-type MessageWithParticipant = MessageRow & {
-  participant_id: string | null;
-  github_name: string | null;
-  github_login: string | null;
-};
+import type { SessionRow, ParticipantRow, EventRow, SandboxRow, SandboxCommand } from "./types";
+import { SessionRepository, type MessageWithParticipant } from "./repository";
+import { RepoSecretsStore } from "../db/repo-secrets";
 
 /**
  * Build GitHub avatar URL from login.
@@ -75,12 +53,6 @@ type MessageWithParticipant = MessageRow & {
 function getGitHubAvatarUrl(githubLogin: string | null | undefined): string | undefined {
   return githubLogin ? `https://github.com/${githubLogin}.png` : undefined;
 }
-
-/**
- * Valid model names for the LLM.
- */
-const VALID_MODELS = ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-5"] as const;
-type ValidModel = (typeof VALID_MODELS)[number];
 
 /**
  * Valid event types for filtering.
@@ -104,37 +76,12 @@ const VALID_EVENT_TYPES = [
 const VALID_MESSAGE_STATUSES = ["pending", "processing", "completed", "failed"] as const;
 
 /**
- * Check if a model name is valid.
- */
-function isValidModel(model: string): model is ValidModel {
-  return VALID_MODELS.includes(model as ValidModel);
-}
-
-/**
- * Default model to use when none specified or invalid.
- */
-const DEFAULT_MODEL: ValidModel = "claude-haiku-4-5";
-
-/**
  * Timeout for WebSocket authentication (in milliseconds).
  * Client WebSockets must send a valid 'subscribe' message within this time
  * or the connection will be closed. This prevents resource abuse from
  * unauthenticated connections that never complete the handshake.
  */
 const WS_AUTH_TIMEOUT_MS = 30000; // 30 seconds
-
-/**
- * Extract provider and model from a model ID.
- * Models with "/" have embedded provider (kept for backward compatibility with existing sessions).
- * Models like "claude-haiku-4-5" use "anthropic" as default provider.
- */
-function extractProviderAndModel(modelId: string): { provider: string; model: string } {
-  if (modelId.includes("/")) {
-    const [provider, ...modelParts] = modelId.split("/");
-    return { provider, model: modelParts.join("/") };
-  }
-  return { provider: "anthropic", model: modelId };
-}
 
 /**
  * Route definition for internal API endpoints.
@@ -147,8 +94,11 @@ interface InternalRoute {
 
 export class SessionDO extends DurableObject<Env> {
   private sql: SqlStorage;
+  private repository: SessionRepository;
+  private clients: Map<WebSocket, ClientInfo>;
+  private sandboxWs: WebSocket | null = null;
   private initialized = false;
-  private isSpawningSandbox = false;
+  private log: Logger;
   // Track pending push operations by branch name
   private pendingPushResolvers = new Map<
     string,
@@ -159,21 +109,8 @@ export class SessionDO extends DurableObject<Env> {
     { resolve: (element: unknown) => void; reject: (err: Error) => void }
   >();
 
-  // Repository layer
-  private messageRepo: MessageRepository;
-  private sessionRepo: SessionRepository;
-  private participantRepo: ParticipantRepository;
-  private eventRepo: EventRepository;
-  private artifactRepo: ArtifactRepository;
-  private sandboxRepo: SandboxRepository;
-
-  // Service layer
-  private wsManager: WebSocketManager | null = null;
-  private presenceManager: PresenceManager | null = null;
-  private eventProcessor: EventProcessor | null = null;
-  private sandboxManager: SandboxManager | null = null;
-  private messageQueue: MessageQueue | null = null;
-  private prCreator: PRCreator | null = null;
+  // Lifecycle manager (lazily initialized)
+  private _lifecycleManager: SandboxLifecycleManager | null = null;
 
   // Route table for internal API endpoints
   private readonly routes: InternalRoute[] = [
@@ -242,96 +179,146 @@ export class SessionDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-
-    // Initialize repositories
-    this.messageRepo = createMessageRepository(this.sql);
-    this.sessionRepo = createSessionRepository(this.sql);
-    this.participantRepo = createParticipantRepository(this.sql);
-    this.eventRepo = createEventRepository(this.sql);
-    this.artifactRepo = createArtifactRepository(this.sql);
-    this.sandboxRepo = createSandboxRepository(this.sql);
+    this.repository = new SessionRepository(this.sql);
+    this.clients = new Map();
+    this.log = createLogger("session-do", {}, parseLogLevel(env.LOG_LEVEL));
+    // Note: session_id context is set in ensureInitialized() once DB is ready
   }
 
   /**
-   * Initialize services with dependencies.
-   * Called lazily on first use to ensure repositories are ready.
+   * Get the lifecycle manager, creating it lazily if needed.
+   * The manager is created with adapters that delegate to the DO's methods.
    */
-  private initServices(): void {
-    if (this.wsManager) return; // Already initialized
+  private get lifecycleManager(): SandboxLifecycleManager {
+    if (!this._lifecycleManager) {
+      this._lifecycleManager = this.createLifecycleManager();
+    }
+    return this._lifecycleManager;
+  }
 
-    // Create WebSocket manager
-    this.wsManager = createWebSocketManager();
+  /**
+   * Create the lifecycle manager with all required adapters.
+   */
+  private createLifecycleManager(): SandboxLifecycleManager {
+    // Verify Modal configuration
+    if (!this.env.MODAL_API_SECRET || !this.env.MODAL_WORKSPACE) {
+      throw new Error("MODAL_API_SECRET and MODAL_WORKSPACE are required for lifecycle manager");
+    }
 
-    // Create presence manager
-    this.presenceManager = createPresenceManager({
-      broadcast: (msg) => this.wsManager!.broadcast(msg),
-    });
+    // Create Modal provider
+    const modalClient = createModalClient(this.env.MODAL_API_SECRET, this.env.MODAL_WORKSPACE);
+    const provider = createModalProvider(modalClient, this.env.MODAL_API_SECRET);
 
-    // Create event processor with callbacks
-    this.eventProcessor = createEventProcessor({
-      eventRepo: this.eventRepo,
-      broadcast: (msg) => this.wsManager!.broadcast(msg),
-      callbacks: {
-        onExecutionComplete: async (messageId, success) => {
-          await this.handleExecutionComplete(messageId, success);
-        },
-        onProcessNextMessage: async () => {
-          await this.processMessageQueue();
-        },
-        triggerSnapshot: async (reason) => {
-          await this.triggerSnapshot(reason);
-        },
-      },
-    });
+    // Storage adapter
+    const storage: SandboxStorage = {
+      getSandbox: () => this.repository.getSandbox(),
+      getSandboxWithCircuitBreaker: () => this.repository.getSandboxWithCircuitBreaker(),
+      getSession: () => this.repository.getSession(),
+      getUserEnvVars: () => this.getUserEnvVars(),
+      updateSandboxStatus: (status) => this.updateSandboxStatus(status),
+      updateSandboxForSpawn: (data) => this.repository.updateSandboxForSpawn(data),
+      updateSandboxModalObjectId: (id) => this.repository.updateSandboxModalObjectId(id),
+      updateSandboxSnapshotImageId: (sandboxId, imageId) =>
+        this.repository.updateSandboxSnapshotImageId(sandboxId, imageId),
+      updateSandboxLastActivity: (timestamp) =>
+        this.repository.updateSandboxLastActivity(timestamp),
+      incrementCircuitBreakerFailure: (timestamp) =>
+        this.repository.incrementCircuitBreakerFailure(timestamp),
+      resetCircuitBreaker: () => this.repository.resetCircuitBreaker(),
+      setLastSpawnError: (error, timestamp) =>
+        this.repository.updateSandboxSpawnError(error, timestamp),
+    };
 
-    // Create sandbox manager
-    this.sandboxManager = createSandboxManager({
-      sandboxRepo: this.sandboxRepo,
-      modalSpawn: async (options) => {
-        return await this.spawnSandboxViaModal(options);
-      },
-      modalRestore: async (options) => {
-        return await this.restoreSandboxViaModal(options);
-      },
-      modalSnapshot: async (options) => {
-        return await this.snapshotSandboxViaModal(options);
-      },
-    });
+    // Broadcaster adapter
+    const broadcaster: SandboxBroadcaster = {
+      broadcast: (message) => this.broadcast(message as ServerMessage),
+    };
 
-    // Create message queue
-    this.messageQueue = createMessageQueue({
-      messageRepo: this.messageRepo,
-      participantRepo: this.participantRepo,
-      getSession: () => this.getSession(),
-      sendToSandbox: async (command) => {
-        return this.sendCommandToSandbox(command);
-      },
-      spawnIfNeeded: async () => {
-        await this.spawnSandboxIfNeeded();
-      },
-    });
-
-    // Create PR creator
-    this.prCreator = createPRCreator({
-      messageRepo: this.messageRepo,
-      participantRepo: this.participantRepo,
-      artifactRepo: this.artifactRepo,
-      getSandboxWebSocket: () => this.wsManager!.getSandboxWebSocket(),
-      safeSend: (ws, message) => this.wsManager!.safeSend(ws, message),
-      registerPushPromise: (branchName, resolve, reject) => {
-        const normalizedBranch = this.normalizeBranchName(branchName);
-        const timeoutId = setTimeout(() => {
-          if (this.pendingPushResolvers.has(normalizedBranch)) {
-            this.pendingPushResolvers.delete(normalizedBranch);
-            reject(new Error("Push operation timed out after 180 seconds"));
+    // WebSocket manager adapter
+    const wsManager: WebSocketManager = {
+      getSandboxWebSocket: () => this.getSandboxWebSocket(),
+      closeSandboxWebSocket: (code, reason) => {
+        const ws = this.getSandboxWebSocket();
+        if (ws) {
+          try {
+            ws.close(code, reason);
+          } catch {
+            // Ignore errors closing WebSocket
           }
-        }, 180000);
-        this.pendingPushResolvers.set(normalizedBranch, { resolve, reject });
-        return { timeoutId };
+          this.sandboxWs = null;
+        }
       },
-      broadcast: (msg) => this.wsManager!.broadcast(msg),
-      tokenEncryptionKey: this.env.TOKEN_ENCRYPTION_KEY,
-    });
+      sendToSandbox: (message) => {
+        const ws = this.getSandboxWebSocket();
+        return ws ? this.safeSend(ws, message) : false;
+      },
+      getConnectedClientCount: () => {
+        return this.ctx.getWebSockets().filter((ws) => {
+          const tags = this.ctx.getTags(ws);
+          return !tags.includes("sandbox") && ws.readyState === WebSocket.OPEN;
+        }).length;
+      },
+    };
+
+    // Alarm scheduler adapter
+    const alarmScheduler: AlarmScheduler = {
+      scheduleAlarm: async (timestamp) => {
+        await this.ctx.storage.setAlarm(timestamp);
+      },
+    };
+
+    // ID generator adapter
+    const idGenerator: IdGenerator = {
+      generateId: () => generateId(),
+    };
+
+    // Build configuration
+    const controlPlaneUrl =
+      this.env.WORKER_URL ||
+      `https://open-inspect-control-plane.${this.env.CF_ACCOUNT_ID || "workers"}.workers.dev`;
+
+    const { provider: llmProvider, model } = extractProviderAndModel(DEFAULT_MODEL);
+
+    // Resolve sessionId for lifecycle manager logging context
+    const session = this.repository.getSession();
+    const sessionId = session?.session_name || session?.id || this.ctx.id.toString();
+
+    const config = {
+      ...DEFAULT_LIFECYCLE_CONFIG,
+      controlPlaneUrl,
+      provider: llmProvider,
+      model,
+      sessionId,
+      inactivity: {
+        ...DEFAULT_LIFECYCLE_CONFIG.inactivity,
+        timeoutMs: parseInt(this.env.SANDBOX_INACTIVITY_TIMEOUT_MS || "600000", 10),
+      },
+    };
+
+    return new SandboxLifecycleManager(
+      provider,
+      storage,
+      broadcaster,
+      wsManager,
+      alarmScheduler,
+      idGenerator,
+      config
+    );
+  }
+
+  private safeSend(ws: WebSocket, message: string | object): boolean {
+    try {
+      if (ws.readyState !== WebSocket.OPEN) {
+        this.log.debug("Cannot send: WebSocket not open", { ready_state: ws.readyState });
+        return false;
+      }
+      const data = typeof message === "string" ? message : JSON.stringify(message);
+      ws.send(data);
+      return true;
+    } catch (e) {
+      this.log.warn("WebSocket send failed", { error: e instanceof Error ? e : String(e) });
+      return false;
+    }
   }
 
   /**
@@ -348,6 +335,13 @@ export class SessionDO extends DurableObject<Env> {
     if (this.initialized) return;
     initSchema(this.sql);
     this.initialized = true;
+    const session = this.repository.getSession();
+    const sessionId = session?.session_name || session?.id || this.ctx.id.toString();
+    this.log = createLogger(
+      "session-do",
+      { session_id: sessionId },
+      parseLogLevel(this.env.LOG_LEVEL)
+    );
   }
 
   /**
@@ -355,6 +349,16 @@ export class SessionDO extends DurableObject<Env> {
    */
   async fetch(request: Request): Promise<Response> {
     this.ensureInitialized();
+
+    // Extract correlation headers and create a request-scoped logger
+    const traceId = request.headers.get("x-trace-id");
+    const requestId = request.headers.get("x-request-id");
+    if (traceId || requestId) {
+      const correlationCtx: Record<string, unknown> = {};
+      if (traceId) correlationCtx.trace_id = traceId;
+      if (requestId) correlationCtx.request_id = requestId;
+      this.log = this.log.child(correlationCtx);
+    }
 
     const url = new URL(request.url);
     const path = url.pathname;
@@ -375,7 +379,28 @@ export class SessionDO extends DurableObject<Env> {
     const route = this.routes.find((r) => r.path === path && r.method === request.method);
 
     if (route) {
-      return route.handler(request, url);
+      const routeStart = Date.now();
+      let status = 500;
+      let outcome: "success" | "error" = "error";
+      try {
+        const response = await route.handler(request, url);
+        status = response.status;
+        outcome = status >= 500 ? "error" : "success";
+        return response;
+      } catch (e) {
+        status = 500;
+        outcome = "error";
+        throw e;
+      } finally {
+        this.log.info("do.request", {
+          event: "do.request",
+          http_method: request.method,
+          http_path: path,
+          http_status: status,
+          duration_ms: Date.now() - routeStart,
+          outcome,
+        });
+      }
     }
 
     return new Response("Not Found", { status: 404 });
@@ -385,11 +410,12 @@ export class SessionDO extends DurableObject<Env> {
    * Handle WebSocket upgrade request.
    */
   private async handleWebSocketUpgrade(request: Request, url: URL): Promise<Response> {
-    console.log("DO: handleWebSocketUpgrade called");
+    this.log.debug("WebSocket upgrade requested");
     const isSandbox = url.searchParams.get("type") === "sandbox";
 
     // Validate sandbox authentication
     if (isSandbox) {
+      const wsStartTime = Date.now();
       const authHeader = request.headers.get("Authorization");
       const sandboxId = request.headers.get("X-Sandbox-ID");
 
@@ -398,31 +424,47 @@ export class SessionDO extends DurableObject<Env> {
       const expectedToken = sandbox?.auth_token;
       const expectedSandboxId = sandbox?.modal_sandbox_id;
 
-      console.log(
-        `[DO] Sandbox auth check: authHeader=${authHeader ? "present" : "missing"}, sandboxId=${sandboxId}, expectedSandboxId=${expectedSandboxId}, status=${sandbox?.status}`
-      );
-
       // Reject connection if sandbox should be stopped (prevents reconnection after inactivity timeout)
       if (sandbox?.status === "stopped" || sandbox?.status === "stale") {
-        console.log(`[DO] Rejecting sandbox connection: sandbox is ${sandbox.status}`);
+        this.log.warn("ws.connect", {
+          event: "ws.connect",
+          ws_type: "sandbox",
+          outcome: "rejected",
+          reject_reason: "sandbox_stopped",
+          sandbox_status: sandbox.status,
+          duration_ms: Date.now() - wsStartTime,
+        });
         return new Response("Sandbox is stopped", { status: 410 });
+      }
+
+      // Validate sandbox ID first (catches stale sandboxes reconnecting after restore)
+      if (expectedSandboxId && sandboxId !== expectedSandboxId) {
+        this.log.warn("ws.connect", {
+          event: "ws.connect",
+          ws_type: "sandbox",
+          outcome: "auth_failed",
+          reject_reason: "sandbox_id_mismatch",
+          expected_sandbox_id: expectedSandboxId,
+          sandbox_id: sandboxId,
+          duration_ms: Date.now() - wsStartTime,
+        });
+        return new Response("Forbidden: Wrong sandbox ID", { status: 403 });
       }
 
       // Validate auth token
       if (!authHeader || authHeader !== `Bearer ${expectedToken}`) {
-        console.log("[DO] Sandbox auth failed: token mismatch");
+        this.log.warn("ws.connect", {
+          event: "ws.connect",
+          ws_type: "sandbox",
+          outcome: "auth_failed",
+          reject_reason: "token_mismatch",
+          duration_ms: Date.now() - wsStartTime,
+        });
         return new Response("Unauthorized: Invalid auth token", { status: 401 });
       }
 
-      // Validate sandbox ID (if we expect a specific one)
-      if (expectedSandboxId && sandboxId !== expectedSandboxId) {
-        console.log(
-          `[DO] Sandbox auth failed: ID mismatch. Expected ${expectedSandboxId}, got ${sandboxId}`
-        );
-        return new Response("Forbidden: Wrong sandbox ID", { status: 403 });
-      }
-
-      console.log("[DO] Sandbox auth passed");
+      // Auth passed — continue to WebSocket accept below
+      // The success ws.connect event is emitted after the WebSocket is accepted
     }
 
     try {
@@ -443,31 +485,40 @@ export class SessionDO extends DurableObject<Env> {
         tags = [`wsid:${wsId}`];
       }
       this.ctx.acceptWebSocket(server, tags);
-      console.log("DO: WebSocket accepted");
 
       if (isSandbox) {
         this.initServices();
         // Close any existing sandbox WebSocket to prevent duplicates
         const existingSandboxWs = this.getSandboxWebSocket();
-        if (existingSandboxWs && existingSandboxWs !== server) {
-          console.log("[DO] Closing existing sandbox WebSocket, new one connecting");
+        const replacedExisting = !!(existingSandboxWs && existingSandboxWs !== server);
+        if (replacedExisting) {
           try {
-            existingSandboxWs.close(1000, "New sandbox connecting");
+            existingSandboxWs!.close(1000, "New sandbox connecting");
           } catch {
             // Ignore errors closing old WebSocket
           }
         }
 
-        this.wsManager!.setSandboxWebSocket(server);
-        this.isSpawningSandbox = false;
-        this.sandboxManager!.updateStatus("ready");
+        this.sandboxWs = server;
+        // Notify manager that sandbox connected so it can reset the spawning flag
+        this.lifecycleManager.onSandboxConnected();
+        this.updateSandboxStatus("ready");
         this.broadcast({ type: "sandbox_status", status: "ready" });
 
         // Set initial activity timestamp and schedule inactivity check
         // IMPORTANT: Must await to ensure alarm is scheduled before returning
-        this.sandboxManager!.updateActivity();
-        console.log(`[DO] Sandbox connected, scheduling inactivity check`);
+        const now = Date.now();
+        this.updateLastActivity(now);
         await this.scheduleInactivityCheck();
+
+        this.log.info("ws.connect", {
+          event: "ws.connect",
+          ws_type: "sandbox",
+          outcome: "success",
+          sandbox_id: sandboxId,
+          replaced_existing: replacedExisting,
+          duration_ms: Date.now() - now,
+        });
 
         // Process any pending messages now that sandbox is connected
         this.processMessageQueue();
@@ -481,7 +532,9 @@ export class SessionDO extends DurableObject<Env> {
 
       return new Response(null, { status: 101, webSocket: client });
     } catch (error) {
-      console.error("DO: WebSocket upgrade error:", error);
+      this.log.error("WebSocket upgrade failed", {
+        error: error instanceof Error ? error : String(error),
+      });
       return new Response("WebSocket upgrade failed", { status: 500 });
     }
   }
@@ -490,11 +543,8 @@ export class SessionDO extends DurableObject<Env> {
    * Handle WebSocket message (with hibernation support).
    */
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    console.log("DO: webSocketMessage received");
+    this.ensureInitialized();
     if (typeof message !== "string") return;
-
-    // Ensure services are initialized before processing messages
-    this.initServices();
 
     const tags = this.ctx.getTags(ws);
     if (tags.includes("sandbox")) {
@@ -508,16 +558,18 @@ export class SessionDO extends DurableObject<Env> {
    * Handle WebSocket close.
    */
   async webSocketClose(ws: WebSocket, _code: number, _reason: string): Promise<void> {
-    this.initServices();
+    this.ensureInitialized();
     const tags = this.ctx.getTags(ws);
 
     if (tags.includes("sandbox")) {
-      this.wsManager!.setSandboxWebSocket(null);
+      const current = this.getSandboxWebSocket();
+      if (current === ws) {
+        this.sandboxWs = null;
+      }
       // Allow sandbox to reconnect: only mark "stopped" when we intentionally stop (inactivity).
-      // Unexpected close (network blip, container restart) → "connecting" so reconnect is accepted.
-      const sandbox = this.getSandbox();
+      const sandbox = this.repository.getSandbox();
       if (sandbox?.status !== "stopped" && sandbox?.status !== "stale") {
-        this.sandboxManager!.updateStatus("connecting");
+        this.updateSandboxStatus("connecting");
         this.broadcast({ type: "sandbox_status", status: "connecting" });
       }
     } else {
@@ -534,7 +586,8 @@ export class SessionDO extends DurableObject<Env> {
    * Handle WebSocket error.
    */
   async webSocketError(ws: WebSocket, error: Error): Promise<void> {
-    console.error("WebSocket error:", error);
+    this.ensureInitialized();
+    this.log.error("WebSocket error", { error });
     ws.close(1011, "Internal error");
   }
 
@@ -577,20 +630,19 @@ export class SessionDO extends DurableObject<Env> {
     const wsIdTag = tags.find((t) => t.startsWith("wsid:"));
     if (wsIdTag) {
       const tagWsId = wsIdTag.replace("wsid:", "");
-      const mappingResult = this.sql.exec(
-        `SELECT participant_id FROM ws_client_mapping WHERE ws_id = ?`,
-        tagWsId
-      );
-      const mappings = mappingResult.toArray() as { participant_id: string }[];
-      if (mappings.length > 0) {
+      if (this.repository.hasWsClientMapping(tagWsId)) {
         return; // Was authenticated before hibernation
       }
     }
 
     // Connection is unauthenticated after timeout - close it
-    console.log(
-      `[DO] Closing unauthenticated WebSocket after ${WS_AUTH_TIMEOUT_MS}ms timeout: ${wsId}`
-    );
+    this.log.warn("ws.connect", {
+      event: "ws.connect",
+      ws_type: "client",
+      outcome: "auth_timeout",
+      ws_id: wsId,
+      timeout_ms: WS_AUTH_TIMEOUT_MS,
+    });
     try {
       ws.close(4008, "Authentication timeout");
     } catch {
@@ -601,212 +653,35 @@ export class SessionDO extends DurableObject<Env> {
   /**
    * Durable Object alarm handler.
    *
-   * Called when a scheduled alarm fires. Used for:
-   * 1. Inactivity monitoring - snapshot and stop after 10 minutes of no activity
-   * 2. Heartbeat monitoring - detect stale sandboxes
-   *
-   * The 10-minute timeout balances cost efficiency with user experience:
-   * - Short enough to avoid wasting resources on abandoned sessions
-   * - Long enough for users to read/think between prompts
-   * - Snapshots preserve all state, so resume is instant
+   * Delegates to the lifecycle manager for inactivity and heartbeat monitoring.
    */
   async alarm(): Promise<void> {
-    console.log("[DO] ===== ALARM FIRED =====");
     this.ensureInitialized();
-
-    const sandbox = this.getSandbox();
-    if (!sandbox) {
-      console.log("[DO] Alarm: no sandbox found");
-      return;
-    }
-
-    console.log(
-      `[DO] Alarm: sandbox status=${sandbox.status}, last_activity=${sandbox.last_activity}, last_heartbeat=${sandbox.last_heartbeat}`
-    );
-
-    // Skip if sandbox is already stopped or failed
-    if (sandbox.status === "stopped" || sandbox.status === "failed" || sandbox.status === "stale") {
-      console.log(`[DO] Alarm: sandbox status is ${sandbox.status}, skipping`);
-      return;
-    }
-
-    const now = Date.now();
-    // Default 10 minutes, can be overridden with SANDBOX_INACTIVITY_TIMEOUT_MS env var for testing
-    const INACTIVITY_TIMEOUT_MS = parseInt(this.env.SANDBOX_INACTIVITY_TIMEOUT_MS || "600000", 10);
-    const HEARTBEAT_TIMEOUT_MS = 90000; // 3x heartbeat interval (30s)
-    console.log(`[DO] Alarm: now=${now}, INACTIVITY_TIMEOUT_MS=${INACTIVITY_TIMEOUT_MS}`);
-
-    // Check heartbeat health first - if stale, stop immediately
-    if (this.handleHeartbeatTimeout(sandbox.last_heartbeat, now, HEARTBEAT_TIMEOUT_MS)) {
-      return;
-    }
-
-    // Check for inactivity - snapshot and stop if no activity for configured time
-    if (sandbox.last_activity && (sandbox.status === "ready" || sandbox.status === "running")) {
-      const inactiveTime = now - sandbox.last_activity;
-      console.log(
-        `[DO] Alarm: inactiveTime=${inactiveTime}ms (${inactiveTime / 1000}s), timeout=${INACTIVITY_TIMEOUT_MS}ms`
-      );
-
-      if (inactiveTime >= INACTIVITY_TIMEOUT_MS) {
-        // Check if any clients are still connected - they may be actively reviewing
-        const connectedClients = this.ctx.getWebSockets().filter((ws) => {
-          const tags = this.ctx.getTags(ws);
-          return !tags.includes("sandbox") && ws.readyState === WebSocket.OPEN;
-        });
-
-        if (connectedClients.length > 0) {
-          console.log(
-            `[DO] Inactivity timeout but ${connectedClients.length} clients connected, extending 5 min`
-          );
-          this.broadcast({
-            type: "sandbox_warning",
-            message:
-              "Sandbox will stop in 5 minutes due to inactivity. Send a message to keep it alive.",
-          });
-          await this.ctx.storage.setAlarm(now + 5 * 60 * 1000);
-          return;
-        }
-
-        console.log(
-          `[DO] Inactivity timeout: ${inactiveTime / 1000}s, triggering snapshot and stop`
-        );
-
-        // IMPORTANT: Set status to "stopped" FIRST to block any reconnection attempts
-        // This prevents race conditions where sandbox reconnects before we finish cleanup
-        this.sandboxManager!.updateStatus("stopped");
-        this.broadcast({ type: "sandbox_status", status: "stopped" });
-        console.log("[DO] Status set to stopped, blocking reconnections");
-
-        // Now take the snapshot (modal_object_id is still in DB)
-        await this.triggerSnapshot("inactivity_timeout");
-
-        // Send shutdown command to sandbox and close WebSocket
-        this.initServices();
-        const sandboxWs = this.getSandboxWebSocket();
-        if (sandboxWs) {
-          this.wsManager!.safeSend(sandboxWs, { type: "shutdown" });
-          try {
-            sandboxWs.close(1000, "Inactivity timeout");
-          } catch {
-            // Ignore errors closing WebSocket
-          }
-          this.wsManager!.setSandboxWebSocket(null);
-        }
-
-        this.broadcast({
-          type: "sandbox_warning",
-          message: "Sandbox stopped due to inactivity, snapshot saved",
-        });
-        return;
-      }
-
-      // Not yet timed out - schedule next check at remaining time (min 30s)
-      const remainingTime = Math.max(INACTIVITY_TIMEOUT_MS - inactiveTime, 30000);
-      console.log(`[DO] Scheduling next alarm in ${remainingTime / 1000}s`);
-      await this.ctx.storage.setAlarm(now + remainingTime);
-    } else {
-      // No last_activity yet - schedule check in 30s
-      await this.ctx.storage.setAlarm(now + 30000);
-    }
+    await this.lifecycleManager.handleAlarm();
   }
-
-  /**
-   * Handle heartbeat timeout detection and response.
-   * If stale, triggers snapshot, updates status to stale, and broadcasts to clients.
-   *
-   * @returns true if heartbeat timed out (caller should return early), false otherwise
-   */
-  private handleHeartbeatTimeout(
-    lastHeartbeat: number | null,
-    now: number,
-    timeoutMs: number
-  ): boolean {
-    if (!lastHeartbeat) {
-      return false;
-    }
-
-    const heartbeatAge = now - lastHeartbeat;
-    if (heartbeatAge > timeoutMs) {
-      console.log(`[DO] Heartbeat timeout: ${heartbeatAge / 1000}s since last heartbeat`);
-      // Use fire-and-forget so status broadcast isn't delayed by snapshot
-      this.ctx.waitUntil(this.triggerSnapshot("heartbeat_timeout"));
-      this.sandboxManager!.updateStatus("stale");
-      this.broadcast({ type: "sandbox_status", status: "stale" });
-      return true;
-    }
-
-    return false;
-  }
-
-  // Note: Heartbeat health is now checked in the main alarm() handler
-  // to avoid alarm conflicts (Durable Objects can only have one alarm at a time)
 
   /**
    * Update the last activity timestamp.
+   * Delegates to the lifecycle manager.
    */
+  private updateLastActivity(timestamp: number): void {
+    this.lifecycleManager.updateLastActivity(timestamp);
+  }
+
   /**
    * Schedule the inactivity check alarm.
-   * Called when sandbox becomes ready or when activity occurs.
+   * Delegates to the lifecycle manager.
    */
   private async scheduleInactivityCheck(): Promise<void> {
-    const INACTIVITY_CHECK_MS = parseInt(this.env.SANDBOX_INACTIVITY_TIMEOUT_MS || "600000", 10);
-    const alarmTime = Date.now() + INACTIVITY_CHECK_MS;
-    console.log(
-      `[DO] Scheduling inactivity check in ${INACTIVITY_CHECK_MS / 1000}s (at ${new Date(alarmTime).toISOString()})`
-    );
-    await this.ctx.storage.setAlarm(alarmTime);
-    console.log(`[DO] Alarm scheduled successfully`);
+    await this.lifecycleManager.scheduleInactivityCheck();
   }
 
   /**
    * Trigger a filesystem snapshot of the sandbox.
-   *
-   * Called when:
-   * - Agent execution completes (per Ramp spec)
-   * - Pre-timeout warning (approaching 2-hour Modal limit)
-   * - Heartbeat timeout (sandbox may be unresponsive)
+   * Delegates to the lifecycle manager.
    */
   private async triggerSnapshot(reason: string): Promise<void> {
-    this.initServices();
-
-    const sandbox = this.sandboxRepo.get();
-    if (!sandbox?.modal_object_id) {
-      console.log("[DO] Cannot snapshot: no modal_object_id");
-      return;
-    }
-
-    // Don't snapshot if already snapshotting
-    if (sandbox.status === "snapshotting") {
-      console.log("[DO] Already snapshotting, skipping");
-      return;
-    }
-
-    // Track previous status only if we're not in a terminal state
-    const isTerminalState =
-      sandbox.status === "stopped" || sandbox.status === "stale" || sandbox.status === "failed";
-    const previousStatus = sandbox.status;
-
-    if (!isTerminalState) {
-      this.sandboxManager!.updateStatus("snapshotting");
-      this.broadcast({ type: "sandbox_status", status: "snapshotting" });
-    }
-
-    try {
-      await this.sandboxManager!.triggerSnapshot(reason);
-    } catch (error) {
-      console.error("[DO] Failed to trigger snapshot:", error);
-      this.broadcast({
-        type: "sandbox_warning",
-        message: error instanceof Error ? error.message : "Snapshot failed",
-      });
-    }
-
-    // Restore previous status if we weren't in a terminal state
-    if (!isTerminalState && reason !== "heartbeat_timeout") {
-      this.sandboxManager!.updateStatus(previousStatus);
-      this.broadcast({ type: "sandbox_status", status: previousStatus });
-    }
+    await this.lifecycleManager.triggerSnapshot(reason);
   }
 
   /**
@@ -823,7 +698,9 @@ export class SessionDO extends DurableObject<Env> {
       const event = JSON.parse(message) as SandboxEvent;
       await this.processSandboxEvent(event);
     } catch (e) {
-      console.error("Error processing sandbox message:", e);
+      this.log.error("Error processing sandbox message", {
+        error: e instanceof Error ? e : String(e),
+      });
     }
   }
 
@@ -860,8 +737,10 @@ export class SessionDO extends DurableObject<Env> {
           break;
       }
     } catch (e) {
-      console.error("Error processing client message:", e);
-      this.wsManager!.safeSend(ws, {
+      this.log.error("Error processing client message", {
+        error: e instanceof Error ? e : String(e),
+      });
+      this.safeSend(ws, {
         type: "error",
         code: "INVALID_MESSAGE",
         message: "Failed to process message",
@@ -878,7 +757,12 @@ export class SessionDO extends DurableObject<Env> {
   ): Promise<void> {
     // Validate the WebSocket auth token
     if (!data.token) {
-      console.log("[DO] WebSocket subscribe rejected: no token provided");
+      this.log.warn("ws.connect", {
+        event: "ws.connect",
+        ws_type: "client",
+        outcome: "auth_failed",
+        reject_reason: "no_token",
+      });
       ws.close(4001, "Authentication required");
       return;
     }
@@ -888,14 +772,24 @@ export class SessionDO extends DurableObject<Env> {
     const participant = this.getParticipantByWsTokenHash(tokenHash);
 
     if (!participant) {
-      console.log("[DO] WebSocket subscribe rejected: invalid token");
+      this.log.warn("ws.connect", {
+        event: "ws.connect",
+        ws_type: "client",
+        outcome: "auth_failed",
+        reject_reason: "invalid_token",
+      });
       ws.close(4001, "Invalid authentication token");
       return;
     }
 
-    console.log(
-      `[DO] WebSocket authenticated: participant=${participant.id}, user=${participant.user_id}`
-    );
+    this.log.info("ws.connect", {
+      event: "ws.connect",
+      ws_type: "client",
+      outcome: "success",
+      participant_id: participant.id,
+      user_id: participant.user_id,
+      client_id: data.clientId,
+    });
 
     // Build client info from participant data
     const clientInfo: ClientInfo = {
@@ -919,15 +813,13 @@ export class SessionDO extends DurableObject<Env> {
       const wsId = wsIdTag.replace("wsid:", "");
       const now = Date.now();
       // Upsert the mapping (in case of reconnection)
-      this.sql.exec(
-        `INSERT OR REPLACE INTO ws_client_mapping (ws_id, participant_id, client_id, created_at)
-         VALUES (?, ?, ?, ?)`,
+      this.repository.upsertWsClientMapping({
         wsId,
-        participant.id,
-        data.clientId,
-        now
-      );
-      console.log(`[DO] Stored ws_client_mapping: wsId=${wsId}, participant=${participant.id}`);
+        participantId: participant.id,
+        clientId: data.clientId,
+        createdAt: now,
+      });
+      this.log.debug("Stored ws_client_mapping", { ws_id: wsId, participant_id: participant.id });
     }
 
     // Set auto-response for ping/pong during hibernation
@@ -952,6 +844,11 @@ export class SessionDO extends DurableObject<Env> {
       },
     } as ServerMessage);
 
+    const sandbox = this.getSandbox();
+    if (sandbox?.last_spawn_error) {
+      this.safeSend(ws, { type: "sandbox_error", error: sandbox.last_spawn_error });
+    }
+
     // Send historical events (messages and sandbox events)
     this.sendHistoricalEvents(ws);
     // Signal end of history so client can flush any pending token (assistant) text
@@ -969,16 +866,10 @@ export class SessionDO extends DurableObject<Env> {
    */
   private sendHistoricalEvents(ws: WebSocket): void {
     // Get messages with participant info (user prompts)
-    const messagesResult = this.sql.exec(
-      `SELECT m.*, p.id as participant_id, p.github_name, p.github_login
-       FROM messages m
-       LEFT JOIN participants p ON m.author_id = p.id
-       ORDER BY m.created_at ASC LIMIT 100`
-    );
-    const messages = messagesResult.toArray() as unknown as MessageWithParticipant[];
+    const messages = this.repository.getMessagesWithParticipants(100);
 
     // Get events (tool calls, tokens, etc.)
-    const events = this.eventRepo.list({ limit: 500 });
+    const events = this.repository.getEventsForReplay(500);
 
     // Combine and sort by timestamp
     interface HistoryItem {
@@ -1053,24 +944,10 @@ export class SessionDO extends DurableObject<Env> {
       const wsIdTag = tags.find((t) => t.startsWith("wsid:"));
       if (wsIdTag) {
         const wsId = wsIdTag.replace("wsid:", "");
-        const mappingResult = this.sql.exec(
-          `SELECT m.participant_id, m.client_id, p.user_id, p.github_name, p.github_login
-           FROM ws_client_mapping m
-           JOIN participants p ON m.participant_id = p.id
-           WHERE m.ws_id = ?`,
-          wsId
-        );
-        const mappings = mappingResult.toArray() as {
-          participant_id: string;
-          client_id: string;
-          user_id: string;
-          github_name: string | null;
-          github_login: string | null;
-        }[];
+        const mapping = this.repository.getWsClientMapping(wsId);
 
-        if (mappings.length > 0) {
-          const mapping = mappings[0];
-          console.log(`[DO] Recovered client info from DB: wsId=${wsId}, user=${mapping.user_id}`);
+        if (mapping) {
+          this.log.info("Recovered client info from DB", { ws_id: wsId, user_id: mapping.user_id });
           client = {
             participantId: mapping.participant_id,
             userId: mapping.user_id,
@@ -1087,7 +964,7 @@ export class SessionDO extends DurableObject<Env> {
       }
 
       // No mapping found - client must reconnect with valid auth
-      console.log("[DO] No client mapping found after hibernation, closing WebSocket");
+      this.log.warn("No client mapping found after hibernation, closing WebSocket");
       ws.close(4002, "Session expired, please reconnect");
       return null;
     }
@@ -1131,26 +1008,38 @@ export class SessionDO extends DurableObject<Env> {
       if (isValidModel(data.model)) {
         messageModel = data.model;
       } else {
-        console.log(`[DO] Invalid message model "${data.model}", ignoring override`);
+        this.log.warn("Invalid message model, ignoring override", { model: data.model });
       }
     }
 
     // Insert message with optional model override
-    this.messageRepo.create({
+    this.repository.createMessage({
       id: messageId,
       authorId: participant.id,
       content: data.content,
       source: "web",
       model: messageModel,
       attachments: data.attachments ? JSON.stringify(data.attachments) : null,
+      status: "pending",
+
       createdAt: now,
     });
 
     // Get queue position
-    const queueResult = this.sql.exec(
-      `SELECT COUNT(*) as count FROM messages WHERE status IN ('pending', 'processing')`
-    );
-    const position = (queueResult.one() as { count: number }).count;
+    const position = this.repository.getPendingOrProcessingCount();
+
+    this.log.info("prompt.enqueue", {
+      event: "prompt.enqueue",
+      message_id: messageId,
+      source: "web",
+      author_id: participant.id,
+      user_id: client.userId,
+      model: messageModel,
+      content_length: data.content.length,
+      has_attachments: !!data.attachments?.length,
+      attachments_count: data.attachments?.length ?? 0,
+      queue_position: position,
+    });
 
     // Confirm to sender
     this.wsManager!.safeSend(ws, {
@@ -1169,9 +1058,8 @@ export class SessionDO extends DurableObject<Env> {
   private async handleTyping(): Promise<void> {
     this.initServices();
     // If no sandbox or not connected, try to warm/spawn one
-    const sandboxWs = this.wsManager!.getSandboxWebSocket();
-    if (!sandboxWs || sandboxWs.readyState !== WebSocket.OPEN) {
-      if (!this.isSpawningSandbox) {
+    if (!this.sandboxWs || this.sandboxWs.readyState !== WebSocket.OPEN) {
+      if (!this.lifecycleManager.isSpawning()) {
         this.broadcast({ type: "sandbox_warming" });
         // Proactively spawn sandbox when user starts typing
         await this.spawnSandbox();
@@ -1198,39 +1086,98 @@ export class SessionDO extends DurableObject<Env> {
    * Process sandbox event.
    */
   private async processSandboxEvent(event: SandboxEvent): Promise<void> {
-    console.log(`[DO] processSandboxEvent: type=${event.type}`);
-
-    // Ensure services are initialized
-    this.initServices();
+    // Heartbeats and token streams are high-frequency — keep at debug to avoid noise
+    // execution_complete is covered by the prompt.complete wide event below
+    if (event.type === "heartbeat" || event.type === "token") {
+      this.log.debug("Sandbox event", { event_type: event.type });
+    } else if (event.type !== "execution_complete") {
+      this.log.info("Sandbox event", { event_type: event.type });
+    }
+    const now = Date.now();
+    const eventId = generateId();
 
     // Get messageId from the event first (sandbox sends correct messageId with every event)
     // Only fall back to DB lookup if event doesn't include messageId (legacy fallback)
     // This prevents race conditions where events from message A arrive after message B starts processing
     const eventMessageId = "messageId" in event ? event.messageId : null;
-    const processingResult = this.sql
-      .exec(`SELECT id FROM messages WHERE status = 'processing' LIMIT 1`)
-      .toArray() as Array<{ id: string }>;
-    const messageId = eventMessageId ?? processingResult[0]?.id ?? null;
+    const processingMessage = this.repository.getProcessingMessage();
+    const messageId = eventMessageId ?? processingMessage?.id ?? null;
 
-    // Process event through EventProcessor (stores in DB and broadcasts)
-    await this.eventProcessor!.processEvent({
+    // Store event
+    this.repository.createEvent({
+      id: eventId,
       type: event.type,
-      data: event,
-      message_id: messageId ?? undefined,
+      data: JSON.stringify(event),
+      messageId,
+      createdAt: now,
     });
 
-    // Handle additional event-specific logic not covered by EventProcessor callbacks
+    // Handle specific event types
+    if (event.type === "execution_complete") {
+      // Use the resolved messageId (which now correctly prioritizes event.messageId)
+      const completionMessageId = messageId ?? event.messageId;
+      const status = event.success ? "completed" : "failed";
+
+      if (completionMessageId) {
+        this.repository.updateMessageCompletion(completionMessageId, status, now);
+
+        // Emit prompt.complete wide event with duration metrics
+        const timestamps = this.repository.getMessageTimestamps(completionMessageId);
+        const totalDurationMs = timestamps ? now - timestamps.created_at : undefined;
+        const processingDurationMs =
+          timestamps?.started_at != null ? now - timestamps.started_at : undefined;
+        const queueDurationMs =
+          timestamps?.started_at != null
+            ? timestamps.started_at - timestamps.created_at
+            : undefined;
+
+        this.log.info("prompt.complete", {
+          event: "prompt.complete",
+          message_id: completionMessageId,
+          outcome: event.success ? "success" : "failure",
+          message_status: status,
+          total_duration_ms: totalDurationMs,
+          processing_duration_ms: processingDurationMs,
+          queue_duration_ms: queueDurationMs,
+        });
+
+        // Broadcast processing status change (after DB update so getIsProcessing is accurate)
+        this.broadcast({ type: "processing_status", isProcessing: this.getIsProcessing() });
+
+        // Notify slack-bot of completion (fire-and-forget with retry)
+        this.ctx.waitUntil(this.notifySlackBot(completionMessageId, event.success));
+      } else {
+        this.log.warn("prompt.complete", {
+          event: "prompt.complete",
+          outcome: "error",
+          error_reason: "no_message_id",
+        });
+      }
+
+      // Take snapshot after execution completes (per Ramp spec)
+      // "When the agent is finished making changes, we take another snapshot"
+      // Use fire-and-forget so snapshot doesn't block the response to the user
+      this.ctx.waitUntil(this.triggerSnapshot("execution_complete"));
+
+      // Reset activity timer - give user time to review output before inactivity timeout
+      this.updateLastActivity(now);
+      await this.scheduleInactivityCheck();
+
+      // Process next in queue
+      await this.processMessageQueue();
+    }
 
     if (event.type === "git_sync") {
-      this.sandboxRepo.updateGitSyncStatus(event.status);
+      this.repository.updateSandboxGitSyncStatus(event.status);
 
       if (event.sha) {
-        this.sessionRepo.updateCurrentSha(event.sha);
+        this.repository.updateSessionCurrentSha(event.sha);
       }
     }
 
     if (event.type === "heartbeat") {
-      this.sandboxManager!.updateHeartbeat();
+      this.repository.updateSandboxHeartbeat(now);
+
       // Note: Don't schedule separate heartbeat alarm - it's handled in the main alarm()
       // which checks both inactivity and heartbeat health
     }
@@ -1240,17 +1187,74 @@ export class SessionDO extends DurableObject<Env> {
       this.handlePushEvent(event);
     }
 
-    // Handle element-at-point response from sandbox
-    if (event.type === "getElementAtPointResponse" || event.type === "getElementAtPointError") {
-      const requestId = (event as { requestId?: string }).requestId;
-      const resolver = requestId ? this.pendingElementResolvers.get(requestId) : undefined;
-      if (resolver) {
-        this.pendingElementResolvers.delete(requestId!);
-        if (event.type === "getElementAtPointResponse") {
-          resolver.resolve(event.element ?? null);
-        } else {
-          resolver.reject(new Error(event.error || "getElementAtPoint failed"));
+    // Broadcast to clients
+    this.broadcast({ type: "sandbox_event", event });
+  }
+
+  /**
+   * Push a branch to remote via the sandbox.
+   * Sends push command to sandbox and waits for completion or error.
+   *
+   * @returns Success result or error message
+   */
+  private async pushBranchToRemote(
+    branchName: string,
+    repoOwner: string,
+    repoName: string,
+    githubToken?: string
+  ): Promise<{ success: true } | { success: false; error: string }> {
+    const sandboxWs = this.getSandboxWebSocket();
+
+    if (!sandboxWs) {
+      // No sandbox connected - user may have already pushed manually
+      this.log.info("No sandbox connected, assuming branch was pushed manually");
+      return { success: true };
+    }
+
+    // Create a promise that will be resolved when push_complete event arrives
+    // Use normalized branch name for map key to handle case/whitespace differences
+    const normalizedBranch = this.normalizeBranchName(branchName);
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+    const pushPromise = new Promise<void>((resolve, reject) => {
+      this.pendingPushResolvers.set(normalizedBranch, { resolve, reject });
+
+      // Timeout after 180 seconds (3 minutes) - git push can take a while
+      timeoutId = setTimeout(() => {
+        if (this.pendingPushResolvers.has(normalizedBranch)) {
+          this.pendingPushResolvers.delete(normalizedBranch);
+          reject(new Error("Push operation timed out after 180 seconds"));
         }
+      }, 180000);
+    });
+
+    // Tell sandbox to push the current branch
+    // Pass GitHub App token for authentication (sandbox uses for git push)
+    // User's OAuth token is NOT sent to sandbox - only used server-side for PR API
+    this.log.info("Sending push command", { branch_name: branchName });
+    this.safeSend(sandboxWs, {
+      type: "push",
+      branchName,
+      repoOwner,
+      repoName,
+      githubToken,
+    });
+
+    // Wait for push_complete or push_error event
+    try {
+      await pushPromise;
+      this.log.info("Push completed successfully", { branch_name: branchName });
+      return { success: true };
+    } catch (pushError) {
+      this.log.error("Push failed", {
+        branch_name: branchName,
+        error: pushError instanceof Error ? pushError : String(pushError),
+      });
+      return { success: false, error: `Failed to push branch: ${pushError}` };
+    } finally {
+      // Clean up timeout to prevent memory leaks
+      if (timeoutId) {
+        clearTimeout(timeoutId);
       }
     }
   }
@@ -1274,14 +1278,14 @@ export class SessionDO extends DurableObject<Env> {
     }
 
     if (event.type === "push_complete") {
-      console.log(
-        `[DO] push_complete event: branchName=${branchName}, pendingResolvers=${Array.from(this.pendingPushResolvers.keys()).join(",")}`
-      );
-      console.log(`[DO] Push completed for branch ${branchName}, resolving promise`);
+      this.log.info("Push completed, resolving promise", {
+        branch_name: branchName,
+        pending_resolvers: Array.from(this.pendingPushResolvers.keys()),
+      });
       resolver.resolve();
     } else if (event.type === "push_error") {
       const error = (event as { error?: string }).error || "Push failed";
-      console.log(`[DO] Push failed for branch ${branchName}: ${error}`);
+      this.log.warn("Push failed for branch", { branch_name: branchName, error });
       resolver.reject(new Error(error));
     }
 
@@ -1315,15 +1319,17 @@ export class SessionDO extends DurableObject<Env> {
           if (sidTag) {
             const tagSandboxId = sidTag.replace("sid:", "");
             if (tagSandboxId !== expectedSandboxId) {
-              console.log(
-                `[DO] Skipping WS with wrong sandbox ID: ${tagSandboxId} (expected ${expectedSandboxId})`
-              );
+              this.log.debug("Skipping WS with wrong sandbox ID", {
+                tag_sandbox_id: tagSandboxId,
+                expected_sandbox_id: expectedSandboxId,
+              });
               continue;
             }
           }
         }
-        console.log("[DO] Recovered sandbox WebSocket from hibernation");
-        this.wsManager!.setSandboxWebSocket(ws);
+        this.log.info("Recovered sandbox WebSocket from hibernation");
+        this.sandboxWs = ws;
+
         return ws;
       }
     }
@@ -1332,140 +1338,100 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   /**
-   * Process message queue.
+   * Warm sandbox proactively.
+   * Delegates to the lifecycle manager.
    */
-  private async processMessageQueue(): Promise<void> {
-    this.initServices();
-    await this.messageQueue!.processQueue();
+  private async warmSandbox(): Promise<void> {
+    await this.lifecycleManager.warmSandbox();
   }
 
   /**
-   * Enforce circuit breaker for sandbox spawning.
-   * Blocks spawning after 3 failures within 5 minutes and broadcasts error to clients.
-   * Resets failure count if the circuit breaker window has passed.
-   *
-   * @returns true if spawning should proceed, false if blocked by circuit breaker
+   * Process message queue.
    */
+  private async processMessageQueue(): Promise<void> {
+    // Check if already processing
+    if (this.repository.getProcessingMessage()) {
+      this.log.debug("processMessageQueue: already processing, returning");
+      return;
+    }
+
+    // Get next pending message
+    const message = this.repository.getNextPendingMessage();
+    if (!message) {
+      return;
+    }
+    const now = Date.now();
+
+    // Check if sandbox is connected (with hibernation recovery)
+    const sandboxWs = this.getSandboxWebSocket();
+    if (!sandboxWs) {
+      // No sandbox connected - spawn one if not already spawning
+      // spawnSandbox has its own persisted status check
+      this.log.info("prompt.dispatch", {
+        event: "prompt.dispatch",
+        message_id: message.id,
+        outcome: "deferred",
+        reason: "no_sandbox",
+      });
+      this.broadcast({ type: "sandbox_spawning" });
+      await this.spawnSandbox();
+      // Don't mark as processing yet - wait for sandbox to connect
+      return;
+    }
+
+    // Mark as processing
+    this.repository.updateMessageToProcessing(message.id, now);
+
+    // Broadcast processing status change (hardcoded true since we just set status above)
+    this.broadcast({ type: "processing_status", isProcessing: true });
+
+    // Reset activity timer - user is actively using the sandbox
+    this.updateLastActivity(now);
+
+    // Get author info (use toArray since author may not exist in participants table)
+    const author = this.repository.getParticipantById(message.author_id);
+
+    // Get session for default model
+    const session = this.getSession();
+
+    // Send to sandbox with model (per-message override or session default)
+    const resolvedModel = message.model || session?.model || "claude-haiku-4-5";
+    const command: SandboxCommand = {
+      type: "prompt",
+      messageId: message.id,
+      content: message.content,
+      model: resolvedModel,
+      author: {
+        userId: author?.user_id ?? "unknown",
+        githubName: author?.github_name ?? null,
+        githubEmail: author?.github_email ?? null,
+      },
+      attachments: message.attachments ? JSON.parse(message.attachments) : undefined,
+    };
+
+    const sent = this.safeSend(sandboxWs, command);
+
+    this.log.info("prompt.dispatch", {
+      event: "prompt.dispatch",
+      message_id: message.id,
+      outcome: sent ? "sent" : "send_failed",
+      model: resolvedModel,
+      author_id: message.author_id,
+      user_id: author?.user_id ?? "unknown",
+      source: message.source,
+      has_sandbox_ws: true,
+      sandbox_ready_state: sandboxWs.readyState,
+      queue_wait_ms: now - message.created_at,
+      has_attachments: !!message.attachments,
+    });
+  }
 
   /**
    * Spawn a sandbox via Modal.
+   * Delegates to the lifecycle manager.
    */
   private async spawnSandbox(): Promise<void> {
-    this.initServices();
-
-    // Check persisted status and last spawn time to prevent duplicate spawns
-    const sandbox = this.sandboxRepo.get();
-    const currentStatus = sandbox?.status;
-    // Only use created_at for cooldown if we have ever spawned (modal_sandbox_id set);
-    // otherwise created_at is session creation time and would block first spawn for 30s
-    const lastSpawnTime = sandbox?.modal_sandbox_id != null ? (sandbox?.created_at ?? 0) : 0;
-    const snapshotImageId = sandbox?.snapshot_image_id ?? sandbox?.snapshot_id;
-    const now = Date.now();
-    const timeSinceLastSpawn = lastSpawnTime > 0 ? now - lastSpawnTime : Number.POSITIVE_INFINITY;
-
-    // Check circuit breaker
-    if (!this.sandboxManager!.canSpawnSandbox()) {
-      console.error("[DO] Circuit breaker open - too many recent spawn failures");
-      const failureInfo = this.sandboxRepo.getSpawnFailureInfo();
-      const CIRCUIT_BREAKER_WINDOW_MS = 5 * 60 * 1000;
-      const timeSinceLastFailure = failureInfo.lastFailure
-        ? Date.now() - failureInfo.lastFailure
-        : 0;
-      this.broadcast({
-        type: "sandbox_error",
-        error: `Sandbox spawning temporarily disabled after ${failureInfo.count} failures. Try again in ${Math.ceil((CIRCUIT_BREAKER_WINDOW_MS - timeSinceLastFailure) / 1000)} seconds.`,
-      });
-      return;
-    }
-
-    // Prevent concurrent spawn/restore (typing + prompt can both trigger; restore path didn't set this)
-    if (this.isSpawningSandbox) {
-      console.log("[DO] spawnSandbox: isSpawningSandbox=true, skipping");
-      return;
-    }
-
-    // Check if we have a snapshot to restore from
-    if (
-      snapshotImageId &&
-      (currentStatus === "stopped" || currentStatus === "stale" || currentStatus === "failed")
-    ) {
-      console.log(`[DO] Found snapshot ${snapshotImageId}, restoring instead of fresh spawn`);
-      this.isSpawningSandbox = true;
-      try {
-        await this.sandboxManager!.restoreFromSnapshot(snapshotImageId);
-        this.sandboxManager!.updateStatus("connecting");
-        this.broadcast({ type: "sandbox_status", status: "connecting" });
-        this.broadcast({
-          type: "sandbox_restored",
-          message: "Session restored from snapshot",
-        });
-      } catch (error) {
-        console.error("Failed to restore sandbox:", error);
-        this.sandboxManager!.updateStatus("failed");
-        this.broadcast({
-          type: "sandbox_error",
-          error: error instanceof Error ? error.message : "Failed to restore sandbox",
-        });
-      } finally {
-        this.isSpawningSandbox = false;
-      }
-      return;
-    }
-
-    // Don't spawn if already spawning or connecting
-    if (currentStatus === "spawning" || currentStatus === "connecting") {
-      console.log(`[DO] spawnSandbox: already ${currentStatus}, skipping`);
-      return;
-    }
-
-    // Don't spawn if status is "ready" and we have an active WebSocket
-    if (currentStatus === "ready") {
-      const existingSandboxWs = this.getSandboxWebSocket();
-      if (existingSandboxWs) {
-        console.log("[DO] spawnSandbox: sandbox ready with active WebSocket, skipping");
-        return;
-      }
-      // If no WebSocket but was recently spawned, wait for reconnect
-      if (timeSinceLastSpawn < 60000) {
-        console.log(
-          `[DO] spawnSandbox: status ready but no WebSocket, last spawn was ${timeSinceLastSpawn / 1000}s ago, waiting`
-        );
-        return;
-      }
-    }
-
-    // Cooldown: don't spawn if last spawn was within 30 seconds
-    if (
-      timeSinceLastSpawn < 30000 &&
-      currentStatus !== "failed" &&
-      currentStatus !== "stopped" &&
-      currentStatus !== "stale"
-    ) {
-      console.log(`[DO] spawnSandbox: last spawn was ${timeSinceLastSpawn / 1000}s ago, waiting`);
-      return;
-    }
-
-    // Also check in-memory flag for same-request protection
-    if (this.isSpawningSandbox) {
-      console.log("[DO] spawnSandbox: isSpawningSandbox=true, skipping");
-      return;
-    }
-
-    this.isSpawningSandbox = true;
-    try {
-      await this.sandboxManager!.spawnSandbox();
-      this.sandboxManager!.updateStatus("connecting");
-      this.broadcast({ type: "sandbox_status", status: "connecting" });
-    } catch (error) {
-      console.error("Failed to spawn sandbox:", error);
-      this.sandboxManager!.updateStatus("failed");
-      this.broadcast({
-        type: "sandbox_error",
-        error: error instanceof Error ? error.message : "Failed to spawn sandbox",
-      });
-    } finally {
-      this.isSpawningSandbox = false;
-    }
+    await this.lifecycleManager.spawnSandbox();
   }
 
   /**
@@ -1532,6 +1498,7 @@ export class SessionDO extends DurableObject<Env> {
       sandboxStatus: sandbox?.status ?? "pending",
       messageCount,
       createdAt: session?.created_at ?? Date.now(),
+      model: session?.model ?? DEFAULT_MODEL,
       isProcessing,
     };
   }
@@ -1540,17 +1507,77 @@ export class SessionDO extends DurableObject<Env> {
    * Check if any message is currently being processed.
    */
   private getIsProcessing(): boolean {
-    return this.messageRepo.getProcessing() !== null;
+    return this.repository.getProcessingMessage() !== null;
   }
 
   // Database helpers
 
   private getSession(): SessionRow | null {
-    return this.sessionRepo.get();
+    return this.repository.getSession();
   }
 
   private getSandbox(): SandboxRow | null {
-    return this.sandboxRepo.get();
+    return this.repository.getSandbox();
+  }
+
+  private async ensureRepoId(session: SessionRow): Promise<number> {
+    if (session.repo_id) {
+      return session.repo_id;
+    }
+
+    const appConfig = getGitHubAppConfig(this.env);
+    if (!appConfig) {
+      throw new Error("GitHub App not configured");
+    }
+
+    const repo = await getInstallationRepository(appConfig, session.repo_owner, session.repo_name);
+    if (!repo) {
+      throw new Error("Repository is not installed for the GitHub App");
+    }
+
+    this.repository.updateSessionRepoId(repo.id);
+    return repo.id;
+  }
+
+  private async getUserEnvVars(): Promise<Record<string, string> | undefined> {
+    const session = this.getSession();
+    if (!session) {
+      this.log.warn("Cannot load secrets: no session");
+      return undefined;
+    }
+
+    if (!this.env.DB || !this.env.REPO_SECRETS_ENCRYPTION_KEY) {
+      this.log.debug("Secrets not configured, skipping", {
+        has_db: !!this.env.DB,
+        has_encryption_key: !!this.env.REPO_SECRETS_ENCRYPTION_KEY,
+      });
+      return undefined;
+    }
+
+    let repoId: number;
+    try {
+      repoId = await this.ensureRepoId(session);
+    } catch (e) {
+      this.log.warn("Cannot resolve repo ID for secrets, proceeding without", {
+        repo_owner: session.repo_owner,
+        repo_name: session.repo_name,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return undefined;
+    }
+
+    const store = new RepoSecretsStore(this.env.DB, this.env.REPO_SECRETS_ENCRYPTION_KEY);
+
+    try {
+      const secrets = await store.getDecryptedSecrets(repoId);
+      return Object.keys(secrets).length === 0 ? undefined : secrets;
+    } catch (e) {
+      this.log.error("Failed to load repo secrets, proceeding without", {
+        repo_id: repoId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return undefined;
+    }
   }
 
   /**
@@ -1569,7 +1596,7 @@ export class SessionDO extends DurableObject<Env> {
 
     const sandbox = this.getSandbox();
     if (!sandbox) {
-      console.log("[DO] Sandbox token verification failed: no sandbox");
+      this.log.warn("Sandbox token verification failed: no sandbox");
       return new Response(JSON.stringify({ valid: false, error: "No sandbox" }), {
         status: 404,
         headers: { "Content-Type": "application/json" },
@@ -1578,7 +1605,9 @@ export class SessionDO extends DurableObject<Env> {
 
     // Check if sandbox is in an active state
     if (sandbox.status === "stopped" || sandbox.status === "stale") {
-      console.log(`[DO] Sandbox token verification failed: sandbox is ${sandbox.status}`);
+      this.log.warn("Sandbox token verification failed: sandbox is stopped/stale", {
+        status: sandbox.status,
+      });
       return new Response(JSON.stringify({ valid: false, error: "Sandbox stopped" }), {
         status: 410,
         headers: { "Content-Type": "application/json" },
@@ -1587,14 +1616,14 @@ export class SessionDO extends DurableObject<Env> {
 
     // Validate the token
     if (body.token !== sandbox.auth_token) {
-      console.log("[DO] Sandbox token verification failed: token mismatch");
+      this.log.warn("Sandbox token verification failed: token mismatch");
       return new Response(JSON.stringify({ valid: false, error: "Invalid token" }), {
         status: 401,
         headers: { "Content-Type": "application/json" },
       });
     }
 
-    console.log("[DO] Sandbox token verified successfully");
+    this.log.info("Sandbox token verified successfully");
     return new Response(JSON.stringify({ valid: true }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
@@ -1674,24 +1703,44 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   private getMessageCount(): number {
-    return this.messageRepo.count();
+    return this.repository.getMessageCount();
   }
 
   private getParticipantByUserId(userId: string): ParticipantRow | null {
-    return this.participantRepo.getByUserId(userId);
+    return this.repository.getParticipantByUserId(userId);
   }
 
   private createParticipant(userId: string, name: string): ParticipantRow {
     const id = generateId();
     const now = Date.now();
 
-    return this.participantRepo.create({
+    this.repository.createParticipant({
       id,
       userId,
       githubName: name,
       role: "member",
       joinedAt: now,
     });
+
+    return {
+      id,
+      user_id: userId,
+      github_user_id: null,
+      github_login: null,
+      github_email: null,
+      github_name: name,
+      role: "member",
+      github_access_token_encrypted: null,
+      github_refresh_token_encrypted: null,
+      github_token_expires_at: null,
+      ws_auth_token: null,
+      ws_token_created_at: null,
+      joined_at: now,
+    };
+  }
+
+  private updateSandboxStatus(status: string): void {
+    this.repository.updateSandboxStatus(status as SandboxStatus);
   }
 
   /**
@@ -1719,15 +1768,16 @@ export class SessionDO extends DurableObject<Env> {
    */
   private async notifySlackBot(messageId: string, success: boolean): Promise<void> {
     // Safely query for callback context
-    const message = this.messageRepo.getById(messageId);
+    const message = this.repository.getMessageCallbackContext(messageId);
+
     if (!message?.callback_context) {
-      console.log(`[DO] No callback context for message ${messageId}, skipping notification`);
+      this.log.debug("No callback context for message, skipping notification", {
+        message_id: messageId,
+      });
       return;
     }
     if (!this.env.SLACK_BOT || !this.env.INTERNAL_CALLBACK_SECRET) {
-      console.log(
-        "[DO] SLACK_BOT or INTERNAL_CALLBACK_SECRET not configured, skipping notification"
-      );
+      this.log.debug("SLACK_BOT or INTERNAL_CALLBACK_SECRET not configured, skipping notification");
       return;
     }
 
@@ -1761,13 +1811,22 @@ export class SessionDO extends DurableObject<Env> {
         });
 
         if (response.ok) {
-          console.log(`[DO] Slack callback succeeded for message ${messageId}`);
+          this.log.info("Slack callback succeeded", { message_id: messageId });
           return;
         }
 
-        console.error(`[DO] Slack callback failed: ${response.status} ${await response.text()}`);
+        const responseText = await response.text();
+        this.log.error("Slack callback failed", {
+          message_id: messageId,
+          status: response.status,
+          response_text: responseText,
+        });
       } catch (e) {
-        console.error(`[DO] Slack callback attempt ${attempt + 1} failed:`, e);
+        this.log.error("Slack callback attempt failed", {
+          message_id: messageId,
+          attempt: attempt + 1,
+          error: e instanceof Error ? e : String(e),
+        });
       }
 
       // Wait before retry
@@ -1776,7 +1835,137 @@ export class SessionDO extends DurableObject<Env> {
       }
     }
 
-    console.error(`[DO] Failed to notify slack-bot after retries for message ${messageId}`);
+    this.log.error("Failed to notify slack-bot after retries", { message_id: messageId });
+  }
+
+  /**
+   * Check if a participant's GitHub token is expired.
+   * Returns true if expired or will expire within buffer time.
+   */
+  private isGitHubTokenExpired(participant: ParticipantRow, bufferMs = 60000): boolean {
+    if (!participant.github_token_expires_at) {
+      return false; // No expiration set, assume valid
+    }
+    return Date.now() + bufferMs >= participant.github_token_expires_at;
+  }
+
+  /**
+   * Refresh an expired GitHub access token using the stored refresh token.
+   *
+   * Returns the updated participant row, or null if refresh cannot be performed.
+   */
+  private async refreshParticipantToken(
+    participant: ParticipantRow
+  ): Promise<ParticipantRow | null> {
+    if (!participant.github_refresh_token_encrypted) {
+      this.log.warn("Cannot refresh: no refresh token stored", { user_id: participant.user_id });
+      return null;
+    }
+
+    if (!this.env.GITHUB_CLIENT_ID || !this.env.GITHUB_CLIENT_SECRET) {
+      this.log.warn("Cannot refresh: GitHub OAuth credentials not configured");
+      return null;
+    }
+
+    try {
+      const refreshToken = await decryptToken(
+        participant.github_refresh_token_encrypted,
+        this.env.TOKEN_ENCRYPTION_KEY
+      );
+
+      const newTokens = await refreshAccessToken(refreshToken, {
+        clientId: this.env.GITHUB_CLIENT_ID,
+        clientSecret: this.env.GITHUB_CLIENT_SECRET,
+        encryptionKey: this.env.TOKEN_ENCRYPTION_KEY,
+      });
+
+      const newAccessTokenEncrypted = await encryptToken(
+        newTokens.access_token,
+        this.env.TOKEN_ENCRYPTION_KEY
+      );
+
+      const newRefreshTokenEncrypted = newTokens.refresh_token
+        ? await encryptToken(newTokens.refresh_token, this.env.TOKEN_ENCRYPTION_KEY)
+        : null;
+
+      const newExpiresAt = newTokens.expires_in
+        ? Date.now() + newTokens.expires_in * 1000
+        : Date.now() + 8 * 60 * 60 * 1000;
+
+      this.repository.updateParticipantTokens(participant.id, {
+        githubAccessTokenEncrypted: newAccessTokenEncrypted,
+        githubRefreshTokenEncrypted: newRefreshTokenEncrypted,
+        githubTokenExpiresAt: newExpiresAt,
+      });
+
+      this.log.info("Server-side token refresh succeeded", { user_id: participant.user_id });
+
+      return this.repository.getParticipantById(participant.id);
+    } catch (error) {
+      this.log.error("Server-side token refresh failed", {
+        user_id: participant.user_id,
+        error: error instanceof Error ? error : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Get the prompting user for PR creation.
+   * Returns the participant who triggered the currently processing message.
+   */
+  private async getPromptingUserForPR(): Promise<
+    | { user: ParticipantRow; error?: never; status?: never }
+    | { user?: never; error: string; status: number }
+  > {
+    // Find the currently processing message
+    const processingMessage = this.repository.getProcessingMessageAuthor();
+
+    if (!processingMessage) {
+      this.log.warn("PR creation failed: no processing message found");
+      return {
+        error: "No active prompt found. PR creation must be triggered by a user prompt.",
+        status: 400,
+      };
+    }
+
+    const participantId = processingMessage.author_id;
+
+    // Get the participant record
+    let participant = this.repository.getParticipantById(participantId);
+
+    if (!participant) {
+      this.log.warn("PR creation failed: participant not found", { participantId });
+      return { error: "User not found. Please re-authenticate.", status: 401 };
+    }
+
+    if (!participant.github_access_token_encrypted) {
+      this.log.warn("PR creation failed: no GitHub token", { userId: participant.user_id });
+      return {
+        error:
+          "Your GitHub token is not available for PR creation. Please reconnect to the session to re-authenticate.",
+        status: 401,
+      };
+    }
+
+    if (this.isGitHubTokenExpired(participant)) {
+      this.log.warn("GitHub token expired, attempting server-side refresh", {
+        userId: participant.user_id,
+      });
+
+      const refreshed = await this.refreshParticipantToken(participant);
+      if (refreshed) {
+        participant = refreshed;
+      } else {
+        return {
+          error:
+            "Your GitHub token has expired and could not be refreshed. Please re-authenticate.",
+          status: 401,
+        };
+      }
+    }
+
+    return { user: participant };
   }
 
   // HTTP handlers
@@ -1786,6 +1975,7 @@ export class SessionDO extends DurableObject<Env> {
       sessionName: string; // The name used for WebSocket routing
       repoOwner: string;
       repoName: string;
+      repoId?: number;
       title?: string;
       model?: string; // LLM model to use
       userId: string;
@@ -1806,68 +1996,64 @@ export class SessionDO extends DurableObject<Env> {
       try {
         const { encryptToken } = await import("../auth/crypto");
         encryptedToken = await encryptToken(body.githubToken, this.env.TOKEN_ENCRYPTION_KEY);
-        console.log("[DO] Encrypted GitHub token for storage");
+        this.log.debug("Encrypted GitHub token for storage");
       } catch (err) {
-        console.error("[DO] Failed to encrypt GitHub token:", err);
+        this.log.error("Failed to encrypt GitHub token", {
+          error: err instanceof Error ? err : String(err),
+        });
       }
     }
 
     // Validate model name if provided
     const model = body.model && isValidModel(body.model) ? body.model : DEFAULT_MODEL;
     if (body.model && !isValidModel(body.model)) {
-      console.log(`[DO] Invalid model name "${body.model}", using default "${DEFAULT_MODEL}"`);
+      this.log.warn("Invalid model name, using default", {
+        requested_model: body.model,
+        default_model: DEFAULT_MODEL,
+      });
     }
 
     // Create session (store both internal ID and external name)
-    this.sessionRepo.create({
+    this.repository.upsertSession({
       id: sessionId,
-      session_name: sessionName,
+      sessionName, // Store the session name for WebSocket routing
       title: body.title ?? null,
-      repo_owner: body.repoOwner,
-      repo_name: body.repoName,
-      repo_default_branch: "main", // Default, will be updated by git sync
-      branch_name: null,
-      base_sha: null,
-      current_sha: null,
-      opencode_session_id: null,
+      repoOwner: body.repoOwner,
+      repoName: body.repoName,
+      repoId: body.repoId ?? null,
       model,
       status: "created",
-      linear_issue_id: null,
-      linear_team_id: null,
+      createdAt: now,
+      updatedAt: now,
     });
 
     // Create sandbox record
     // Note: created_at is set to 0 initially so the first spawn isn't blocked by cooldown
     // It will be updated to the actual spawn time when spawnSandbox() is called
     const sandboxId = generateId();
-    this.sandboxRepo.create({
+    this.repository.createSandbox({
       id: sandboxId,
-      modal_sandbox_id: null,
-      modal_object_id: null,
-      snapshot_id: null,
-      snapshot_image_id: null,
-      auth_token: null,
       status: "pending",
-      git_sync_status: "pending",
-      last_heartbeat: null,
-      last_activity: null,
-      preview_tunnel_url: null,
-      tunnel_urls: null,
-      created_at: 0,
+      gitSyncStatus: "pending",
+      createdAt: 0,
     });
 
     // Create owner participant with encrypted GitHub token
     const participantId = generateId();
-    this.participantRepo.create({
+    this.repository.createParticipant({
       id: participantId,
       userId: body.userId,
-      githubLogin: body.githubLogin,
-      githubName: body.githubName,
-      githubEmail: body.githubEmail,
+      githubLogin: body.githubLogin ?? null,
+      githubName: body.githubName ?? null,
+      githubEmail: body.githubEmail ?? null,
+
       githubAccessTokenEncrypted: encryptedToken,
       role: "owner",
       joinedAt: now,
     });
+
+    this.log.info("Triggering sandbox spawn for new session");
+    this.ctx.waitUntil(this.warmSandbox());
 
     return Response.json({ sessionId, status: "created" });
   }
@@ -1908,6 +2094,7 @@ export class SessionDO extends DurableObject<Env> {
       currentSha: session.current_sha,
       opencodeSessionId: session.opencode_session_id,
       status: session.status,
+      model: session.model,
       createdAt: session.created_at,
       updatedAt: session.updated_at,
       linearIssueId: session.linear_issue_id ?? undefined,
@@ -2033,7 +2220,6 @@ export class SessionDO extends DurableObject<Env> {
 
   private async handleEnqueuePrompt(request: Request): Promise<Response> {
     try {
-      console.log("handleEnqueuePrompt: start");
       const body = (await request.json()) as {
         content: string;
         authorId: string;
@@ -2047,18 +2233,10 @@ export class SessionDO extends DurableObject<Env> {
         };
       };
 
-      console.log("handleEnqueuePrompt: parsed body", {
-        content: body.content?.substring(0, 50),
-        authorId: body.authorId,
-        source: body.source,
-        hasCallbackContext: !!body.callbackContext,
-      });
-
       // Get or create participant for the author
       // The authorId here is a user ID (like "anonymous"), not a participant row ID
       let participant = this.getParticipantByUserId(body.authorId);
       if (!participant) {
-        console.log("handleEnqueuePrompt: creating participant for", body.authorId);
         participant = this.createParticipant(body.authorId, body.authorId);
       }
 
@@ -2072,13 +2250,40 @@ export class SessionDO extends DurableObject<Env> {
         callbackContext: body.callbackContext,
       });
 
-      console.log("handleEnqueuePrompt: message enqueued, processing queue");
+      this.repository.createMessage({
+        id: messageId,
+        authorId: participant.id, // Use the participant's row ID, not the user ID
+        content: body.content,
+        source: body.source as MessageSource,
+        attachments: body.attachments ? JSON.stringify(body.attachments) : null,
+        callbackContext: body.callbackContext ? JSON.stringify(body.callbackContext) : null,
+        status: "pending",
+        createdAt: now,
+      });
+
+      const queuePosition = this.repository.getPendingOrProcessingCount();
+
+      this.log.info("prompt.enqueue", {
+        event: "prompt.enqueue",
+        message_id: messageId,
+        source: body.source,
+        author_id: participant.id,
+        user_id: body.authorId,
+        model: null,
+        content_length: body.content.length,
+        has_attachments: !!body.attachments?.length,
+        attachments_count: body.attachments?.length ?? 0,
+        has_callback_context: !!body.callbackContext,
+        queue_position: queuePosition,
+      });
+
       await this.processMessageQueue();
 
-      console.log("handleEnqueuePrompt: done");
       return Response.json({ messageId, status: "queued" });
     } catch (error) {
-      console.error("handleEnqueuePrompt error:", error);
+      this.log.error("handleEnqueuePrompt error", {
+        error: error instanceof Error ? error : String(error),
+      });
       throw error;
     }
   }
@@ -2095,7 +2300,7 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   private handleListParticipants(): Response {
-    const participants = this.participantRepo.list();
+    const participants = this.repository.listParticipants();
 
     return Response.json({
       participants: participants.map((p) => ({
@@ -2121,13 +2326,14 @@ export class SessionDO extends DurableObject<Env> {
     const id = generateId();
     const now = Date.now();
 
-    this.participantRepo.create({
+    this.repository.createParticipant({
       id,
       userId: body.userId,
-      githubLogin: body.githubLogin,
-      githubName: body.githubName,
-      githubEmail: body.githubEmail,
-      role: body.role ?? "member",
+      githubLogin: body.githubLogin ?? null,
+      githubName: body.githubName ?? null,
+      githubEmail: body.githubEmail ?? null,
+      role: (body.role ?? "member") as ParticipantRole,
+
       joinedAt: now,
     });
 
@@ -2145,29 +2351,7 @@ export class SessionDO extends DurableObject<Env> {
       return Response.json({ error: `Invalid event type: ${type}` }, { status: 400 });
     }
 
-    let query = `SELECT * FROM events WHERE 1=1`;
-    const params: (string | number)[] = [];
-
-    if (type) {
-      query += ` AND type = ?`;
-      params.push(type);
-    }
-
-    if (messageId) {
-      query += ` AND message_id = ?`;
-      params.push(messageId);
-    }
-
-    if (cursor) {
-      query += ` AND created_at < ?`;
-      params.push(parseInt(cursor));
-    }
-
-    query += ` ORDER BY created_at DESC LIMIT ?`;
-    params.push(limit + 1);
-
-    const result = this.sql.exec(query, ...params);
-    const events = result.toArray() as unknown as EventRow[];
+    const events = this.repository.listEvents({ cursor, limit, type, messageId });
     const hasMore = events.length > limit;
 
     if (hasMore) events.pop();
@@ -2186,7 +2370,7 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   private handleListArtifacts(): Response {
-    const artifacts = this.artifactRepo.list();
+    const artifacts = this.repository.listArtifacts();
 
     return Response.json({
       artifacts: artifacts.map((a) => ({
@@ -2447,24 +2631,7 @@ export class SessionDO extends DurableObject<Env> {
       return Response.json({ error: `Invalid message status: ${status}` }, { status: 400 });
     }
 
-    let query = `SELECT * FROM messages WHERE 1=1`;
-    const params: (string | number)[] = [];
-
-    if (status) {
-      query += ` AND status = ?`;
-      params.push(status);
-    }
-
-    if (cursor) {
-      query += ` AND created_at < ?`;
-      params.push(parseInt(cursor));
-    }
-
-    query += ` ORDER BY created_at DESC LIMIT ?`;
-    params.push(limit + 1);
-
-    const result = this.sql.exec(query, ...params);
-    const messages = result.toArray() as unknown as MessageRow[];
+    const messages = this.repository.listMessages({ cursor, limit, status });
     const hasMore = messages.length > limit;
 
     if (hasMore) messages.pop();
@@ -2511,7 +2678,7 @@ export class SessionDO extends DurableObject<Env> {
       return Response.json({ error: promptingUser.error }, { status: promptingUser.status });
     }
 
-    console.log(`[DO] Creating PR as user: ${promptingUser.user.user_id}`);
+    this.log.info("Creating PR", { user_id: promptingUser.user.user_id });
 
     const user = promptingUser.user;
 
@@ -2536,9 +2703,11 @@ export class SessionDO extends DurableObject<Env> {
       if (appConfig) {
         try {
           pushToken = await generateInstallationToken(appConfig);
-          console.log("[DO] Generated fresh GitHub App token for push");
+          this.log.info("Generated fresh GitHub App token for push");
         } catch (err) {
-          console.error("[DO] Failed to generate app token, push may fail:", err);
+          this.log.error("Failed to generate app token, push may fail", {
+            error: err instanceof Error ? err : String(err),
+          });
         }
       }
 
@@ -2559,15 +2728,48 @@ export class SessionDO extends DurableObject<Env> {
       const sessionUrl = `${webAppUrl}/session/${sessionId}`;
       const fullBody = body.body + `\n\n---\n*Created with [Open-Inspect](${sessionUrl})*`;
 
-      // Create the PR using GitHub API and store artifact
-      const prResult = await this.prCreator!.createPR({
-        title: body.title,
-        body: fullBody,
-        baseBranch,
-        headBranch,
-        repoOwner: session.repo_owner,
-        repoName: session.repo_name,
-        userToken: user.github_access_token_encrypted!,
+      // Create the PR using GitHub API (using the prompting user's token)
+      const prResult = await createPullRequest(
+        {
+          accessTokenEncrypted: user.github_access_token_encrypted!,
+          owner: session.repo_owner,
+          repo: session.repo_name,
+          title: body.title,
+          body: fullBody,
+          head: headBranch,
+          base: baseBranch,
+        },
+        this.env.TOKEN_ENCRYPTION_KEY
+      );
+
+      // Store the PR as an artifact
+      const artifactId = generateId();
+      const now = Date.now();
+      this.repository.createArtifact({
+        id: artifactId,
+        type: "pr",
+        url: prResult.htmlUrl,
+        metadata: JSON.stringify({
+          number: prResult.number,
+          state: prResult.state,
+          head: headBranch,
+          base: baseBranch,
+        }),
+        createdAt: now,
+      });
+
+      // Update session with branch name
+      this.repository.updateSessionBranch(session.id, headBranch);
+
+      // Broadcast PR creation to all clients
+      this.broadcast({
+        type: "artifact_created",
+        artifact: {
+          id: artifactId,
+          type: "pr",
+          url: prResult.htmlUrl,
+          prNumber: prResult.number,
+        },
       });
 
       // Update session with branch name
@@ -2579,7 +2781,9 @@ export class SessionDO extends DurableObject<Env> {
         state: prResult.state,
       });
     } catch (error) {
-      console.error("[DO] PR creation failed:", error);
+      this.log.error("PR creation failed", {
+        error: error instanceof Error ? error : String(error),
+      });
       return Response.json(
         { error: error instanceof Error ? error.message : "Failed to create PR" },
         { status: 500 }
@@ -2605,6 +2809,7 @@ export class SessionDO extends DurableObject<Env> {
       githubName?: string;
       githubEmail?: string;
       githubTokenEncrypted?: string | null; // Encrypted GitHub OAuth token for PR creation
+      githubRefreshTokenEncrypted?: string | null; // Encrypted GitHub OAuth refresh token
       githubTokenExpiresAt?: number | null; // Token expiry timestamp in milliseconds
     };
 
@@ -2618,40 +2823,53 @@ export class SessionDO extends DurableObject<Env> {
     let participant = this.getParticipantByUserId(body.userId);
 
     if (participant) {
-      // Update existing participant with any new info
-      // Use COALESCE for token fields to only update if new values provided
-      this.sql.exec(
-        `UPDATE participants SET
-           github_user_id = COALESCE(?, github_user_id),
-           github_login = COALESCE(?, github_login),
-           github_name = COALESCE(?, github_name),
-           github_email = COALESCE(?, github_email),
-           github_access_token_encrypted = COALESCE(?, github_access_token_encrypted),
-           github_token_expires_at = COALESCE(?, github_token_expires_at)
-         WHERE id = ?`,
-        body.githubUserId ?? null,
-        body.githubLogin ?? null,
-        body.githubName ?? null,
-        body.githubEmail ?? null,
-        body.githubTokenEncrypted ?? null,
-        body.githubTokenExpiresAt ?? null,
-        participant.id
-      );
+      // Only accept client tokens if they're newer than what we have in the DB.
+      // The server-side refresh may have rotated tokens, and the client could
+      // be sending stale values from an old session cookie.
+      const clientExpiresAt = body.githubTokenExpiresAt ?? null;
+      const dbExpiresAt = participant.github_token_expires_at;
+      const clientSentAnyToken =
+        body.githubTokenEncrypted != null || body.githubRefreshTokenEncrypted != null;
+
+      const shouldUpdateTokens =
+        clientSentAnyToken &&
+        (dbExpiresAt == null || (clientExpiresAt != null && clientExpiresAt >= dbExpiresAt));
+
+      // If we already have a refresh token (server-side refresh may rotate it),
+      // only accept an incoming refresh token when we're also accepting the
+      // access token update, or when we don't have one yet.
+      const shouldUpdateRefreshToken =
+        body.githubRefreshTokenEncrypted != null &&
+        (participant.github_refresh_token_encrypted == null || shouldUpdateTokens);
+
+      this.repository.updateParticipantCoalesce(participant.id, {
+        githubUserId: body.githubUserId ?? null,
+        githubLogin: body.githubLogin ?? null,
+        githubName: body.githubName ?? null,
+        githubEmail: body.githubEmail ?? null,
+        githubAccessTokenEncrypted: shouldUpdateTokens ? (body.githubTokenEncrypted ?? null) : null,
+        githubRefreshTokenEncrypted: shouldUpdateRefreshToken
+          ? (body.githubRefreshTokenEncrypted ?? null)
+          : null,
+        githubTokenExpiresAt: shouldUpdateTokens ? clientExpiresAt : null,
+      });
     } else {
       // Create new participant with optional GitHub token
       const id = generateId();
-      participant = this.participantRepo.create({
+      this.repository.createParticipant({
         id,
         userId: body.userId,
-        githubUserId: body.githubUserId,
-        githubLogin: body.githubLogin,
-        githubName: body.githubName,
-        githubEmail: body.githubEmail,
-        githubAccessTokenEncrypted: body.githubTokenEncrypted,
-        githubTokenExpiresAt: body.githubTokenExpiresAt,
+        githubUserId: body.githubUserId ?? null,
+        githubLogin: body.githubLogin ?? null,
+        githubName: body.githubName ?? null,
+        githubEmail: body.githubEmail ?? null,
+        githubAccessTokenEncrypted: body.githubTokenEncrypted ?? null,
+        githubRefreshTokenEncrypted: body.githubRefreshTokenEncrypted ?? null,
+        githubTokenExpiresAt: body.githubTokenExpiresAt ?? null,
         role: "member",
         joinedAt: now,
       });
+      participant = this.getParticipantByUserId(body.userId)!;
     }
 
     // Generate a new WebSocket token (32 bytes = 256 bits)
@@ -2659,9 +2877,9 @@ export class SessionDO extends DurableObject<Env> {
     const tokenHash = await hashToken(plainToken);
 
     // Store the hash (invalidates any previous token)
-    this.participantRepo.updateWsAuthToken(participant.id, tokenHash, now);
+    this.repository.updateParticipantWsToken(participant.id, tokenHash, now);
 
-    console.log(`[DO] Generated WS token for participant ${participant.id} (user: ${body.userId})`);
+    this.log.info("Generated WS token", { participant_id: participant.id, user_id: body.userId });
 
     return Response.json({
       token: plainToken,
@@ -2673,7 +2891,7 @@ export class SessionDO extends DurableObject<Env> {
    * Get participant by WebSocket token hash.
    */
   private getParticipantByWsTokenHash(tokenHash: string): ParticipantRow | null {
-    return this.participantRepo.getByWsAuthToken(tokenHash);
+    return this.repository.getParticipantByWsTokenHash(tokenHash);
   }
 
   /**
@@ -2704,7 +2922,8 @@ export class SessionDO extends DurableObject<Env> {
       return Response.json({ error: "Not authorized to archive this session" }, { status: 403 });
     }
 
-    this.sessionRepo.updateStatus("archived");
+    const now = Date.now();
+    this.repository.updateSessionStatus(session.id, "archived", now);
 
     // Broadcast status change to all connected clients
     this.broadcast({
@@ -2743,7 +2962,8 @@ export class SessionDO extends DurableObject<Env> {
       return Response.json({ error: "Not authorized to unarchive this session" }, { status: 403 });
     }
 
-    this.sessionRepo.updateStatus("active");
+    const now = Date.now();
+    this.repository.updateSessionStatus(session.id, "active", now);
 
     // Broadcast status change to all connected clients
     this.broadcast({

@@ -22,6 +22,12 @@ locals {
       name    = svc.binding_name
       service = svc.service_name
     }] : [],
+    # D1 database bindings
+    [for db in var.d1_databases : {
+      type = "d1"
+      name = db.binding_name
+      id   = db.database_id
+    }],
     # Plain text bindings (environment variables)
     [for pt in var.plain_text_bindings : {
       type = "plain_text"
@@ -57,7 +63,13 @@ resource "cloudflare_worker" "this" {
   }
 
   observability = {
-    enabled = true
+    enabled            = true
+    head_sampling_rate = 1
+    logs = {
+      enabled            = true
+      head_sampling_rate = 1
+      invocation_logs    = true
+    }
   }
 }
 

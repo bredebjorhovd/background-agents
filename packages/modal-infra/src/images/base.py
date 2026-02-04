@@ -23,8 +23,8 @@ SANDBOX_DIR = Path(__file__).parent.parent / "sandbox"
 OPENCODE_VERSION = "latest"
 
 # Cache buster - change this to force Modal image rebuild
-# v39: fix dead preview links - clear stale tunnel URLs on spawn, retry tunnel fetch
-CACHE_BUSTER = "v40-dead-preview-link-fix"
+# v41: merge - dead preview fix + jq in base image
+CACHE_BUSTER = "v41-merge-preview-and-jq"
 
 # code-server version to install
 CODE_SERVER_VERSION = "4.96.2"
@@ -40,6 +40,7 @@ base_image = (
         "ca-certificates",
         "gnupg",
         "openssh-client",
+        "jq",
         "unzip",  # Required for Bun installation
         # For Playwright
         "libnss3",

@@ -21,6 +21,7 @@ export interface SessionRow {
   title: string | null;
   repo_owner: string;
   repo_name: string;
+  repo_id: number | null;
   repo_default_branch: string;
   branch_name: string | null;
   base_sha: string | null;
@@ -92,6 +93,8 @@ export interface SandboxRow {
   git_sync_status: GitSyncStatus;
   last_heartbeat: number | null;
   last_activity: number | null; // Last activity timestamp for inactivity-based snapshot
+  last_spawn_error: string | null;
+  last_spawn_error_at: number | null;
   created_at: number;
   preview_tunnel_url: string | null; // Public URL for live preview (port 5173, primary)
   tunnel_urls: string | null; // JSON: Record<port, url> for all exposed ports

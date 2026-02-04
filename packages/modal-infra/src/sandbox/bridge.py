@@ -25,78 +25,13 @@ from typing import Any, ClassVar, NamedTuple
 import httpx
 import websockets
 from websockets import ClientConnection, State
+from websockets.exceptions import InvalidStatus
 
-from .sandbox_types import GitUser
+from .get_element_at_point import GET_ELEMENT_SCRIPT
+from .log_config import configure_logging, get_logger
+from .types import GitUser
 
-# Injected into the page for element-at-point - runs in browser context. Same logic as get_element_at_point.py.
-GET_ELEMENT_AT_POINT_SCRIPT = """
-([x, y]) => {
-  const el = document.elementFromPoint(x, y);
-  if (!el) return null;
-
-  function generateSelector(element) {
-    if (element.id) return '#' + element.id;
-    const path = [];
-    let current = element;
-    while (current && current !== document.body) {
-      let sel = current.tagName.toLowerCase();
-      if (current.className && typeof current.className === 'string') {
-        const classes = current.className.trim().split(/\\s+/).filter(c => c && !c.startsWith('_'));
-        if (classes.length > 0) sel += '.' + classes.slice(0, 2).join('.');
-      }
-      const siblings = current.parentElement?.children;
-      if (siblings && siblings.length > 1) {
-        const same = Array.from(siblings).filter(s => s.tagName === current.tagName);
-        if (same.length > 1) sel += ':nth-of-type(' + (same.indexOf(current) + 1) + ')';
-      }
-      path.unshift(sel);
-      current = current.parentElement;
-      if (path.length >= 3) break;
-    }
-    return path.join(' > ');
-  }
-
-  function getReactInfo(element) {
-    const key = Object.keys(element).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
-    if (!key) return null;
-    try {
-      let node = element[key];
-      while (node) {
-        if (node.type && typeof node.type === 'function') {
-          const name = node.type.displayName || node.type.name || 'Unknown';
-          const props = node.memoizedProps || {};
-          const clean = {};
-          for (const [k, v] of Object.entries(props)) {
-            if (k === 'children' || typeof v === 'function' || (typeof v === 'object' && v !== null)) continue;
-            clean[k] = v;
-          }
-          return { name, props: clean };
-        }
-        if (node.type && typeof node.type === 'string') { node = node.return; continue; }
-        node = node.return;
-      }
-    } catch (e) {}
-    return null;
-  }
-
-  const selector = generateSelector(el);
-  const react = getReactInfo(el);
-  const rect = el.getBoundingClientRect();
-  const root = document.documentElement;
-  return {
-    selector,
-    tagName: el.tagName.toLowerCase(),
-    text: el.innerText ? el.innerText.slice(0, 200) : null,
-    react: react || undefined,
-    viewport: {
-      width: root?.clientWidth || window.innerWidth,
-      height: root?.clientHeight || window.innerHeight,
-      devicePixelRatio: window.devicePixelRatio
-    },
-    boundingRect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
-  };
-}
-"""
+configure_logging()
 
 
 class TokenResolution(NamedTuple):
@@ -171,8 +106,13 @@ class SSEConnectionError(Exception):
     pass
 
 
-class ToolPolicyError(Exception):
-    """Raised when a tool call violates an allowlist policy."""
+class SessionTerminatedError(Exception):
+    """Raised when the control plane has terminated the session (HTTP 410).
+
+    This is a non-recoverable error - the bridge should exit gracefully
+    rather than retry. The session can be restored via user action (sending
+    a new prompt), which will trigger snapshot restoration on the control plane.
+    """
 
     pass
 
@@ -192,7 +132,14 @@ class AgentBridge:
     HEARTBEAT_INTERVAL = 30.0
     RECONNECT_BACKOFF_BASE = 2.0
     RECONNECT_MAX_DELAY = 60.0
-    MAX_BUFFERED_PARTS = 10000  # Prevent unbounded memory growth
+    SSE_INACTIVITY_TIMEOUT = 120.0
+    SSE_INACTIVITY_TIMEOUT_MIN = 5.0
+    SSE_INACTIVITY_TIMEOUT_MAX = 3600.0
+    HTTP_CONNECT_TIMEOUT = 30.0
+    HTTP_DEFAULT_TIMEOUT = 30.0
+    OPENCODE_REQUEST_TIMEOUT = 10.0
+    PROMPT_MAX_DURATION = 5400.0
+    MAX_PENDING_PART_EVENTS = 2000
 
     def __init__(
         self,
@@ -208,6 +155,21 @@ class AgentBridge:
         self.auth_token = auth_token
         self.opencode_port = opencode_port
         self.opencode_base_url = f"http://localhost:{opencode_port}"
+
+        # Logger
+        self.log = get_logger(
+            "bridge",
+            service="sandbox",
+            sandbox_id=sandbox_id,
+            session_id=session_id,
+        )
+
+        self.sse_inactivity_timeout = self._resolve_timeout_seconds(
+            name="BRIDGE_SSE_INACTIVITY_TIMEOUT",
+            default=self.SSE_INACTIVITY_TIMEOUT,
+            min_value=self.SSE_INACTIVITY_TIMEOUT_MIN,
+            max_value=self.SSE_INACTIVITY_TIMEOUT_MAX,
+        )
 
         self.ws: ClientConnection | None = None
         self.shutdown_event = asyncio.Event()
@@ -243,10 +205,19 @@ class AgentBridge:
         return f"{url}/sessions/{self.session_id}/ws?type=sandbox"
 
     async def run(self) -> None:
-        """Main bridge loop with reconnection handling."""
-        print(f"[bridge] Starting bridge for sandbox {self.sandbox_id}")
+        """Main bridge loop with reconnection handling.
 
-        self.http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0))
+        Handles reconnection for transient errors (network issues, etc.) but
+        exits gracefully for terminal errors like HTTP 410 (session terminated).
+        """
+        self.log.info("bridge.run_start")
+
+        self.http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                self.HTTP_DEFAULT_TIMEOUT,
+                connect=self.HTTP_CONNECT_TIMEOUT,
+            )
+        )
         await self._load_session_id()
 
         reconnect_attempts = 0
@@ -256,10 +227,37 @@ class AgentBridge:
                 try:
                     await self._connect_and_run()
                     reconnect_attempts = 0
+                except SessionTerminatedError as e:
+                    # Non-recoverable: session has been terminated by control plane
+                    self.log.info(
+                        "bridge.disconnect",
+                        reason="session_terminated",
+                        detail=str(e),
+                    )
+                    self.shutdown_event.set()
+                    break
                 except websockets.ConnectionClosed as e:
-                    print(f"[bridge] Connection closed: {e}")
+                    self.log.warn(
+                        "bridge.disconnect",
+                        reason="connection_closed",
+                        ws_close_code=e.code,
+                    )
                 except Exception as e:
-                    print(f"[bridge] Connection error: {e}")
+                    error_str = str(e)
+                    # Check for fatal HTTP errors that shouldn't trigger retry
+                    if self._is_fatal_connection_error(error_str):
+                        self.log.error(
+                            "bridge.disconnect",
+                            reason="fatal_error",
+                            exc=e,
+                        )
+                        self.shutdown_event.set()
+                        break
+                    self.log.warn(
+                        "bridge.disconnect",
+                        reason="connection_error",
+                        detail=error_str,
+                    )
 
                 if self.shutdown_event.is_set():
                     break
@@ -269,63 +267,100 @@ class AgentBridge:
                     self.RECONNECT_BACKOFF_BASE**reconnect_attempts,
                     self.RECONNECT_MAX_DELAY,
                 )
-                print(f"[bridge] Reconnecting in {delay:.1f}s (attempt {reconnect_attempts})...")
+                self.log.info(
+                    "bridge.reconnect",
+                    attempt=reconnect_attempts,
+                    delay_s=round(delay, 1),
+                )
                 await asyncio.sleep(delay)
 
         finally:
             if self.http_client:
                 await self.http_client.aclose()
 
-    async def _connect_and_run(self) -> None:
-        """Connect to control plane and handle messages."""
-        print(f"[bridge] Connecting to {self.ws_url}")
+    def _is_fatal_connection_error(self, error_str: str) -> bool:
+        """Check if a connection error is fatal and shouldn't trigger retry.
 
+        Fatal errors indicate the session is invalid or terminated, not a
+        transient network issue. These include:
+        - HTTP 401 (Unauthorized): Auth token invalid or expired
+        - HTTP 403 (Forbidden): Access denied
+        - HTTP 404 (Not Found): Session doesn't exist
+        - HTTP 410 (Gone): Session terminated, sandbox stopped/stale
+
+        For these errors, retrying is futile - the bridge should exit and
+        allow the control plane to spawn a new sandbox if needed.
+        """
+        fatal_patterns = [
+            "HTTP 401",  # Unauthorized
+            "HTTP 403",  # Forbidden
+            "HTTP 404",  # Session not found
+            "HTTP 410",  # Session terminated (stopped/stale)
+        ]
+        return any(pattern in error_str for pattern in fatal_patterns)
+
+    async def _connect_and_run(self) -> None:
+        """Connect to control plane and handle messages.
+
+        Raises:
+            SessionTerminatedError: If the control plane rejects the connection
+                with HTTP 410 (session stopped/stale).
+        """
         additional_headers = {
             "Authorization": f"Bearer {self.auth_token}",
             "X-Sandbox-ID": self.sandbox_id,
         }
 
-        async with websockets.connect(
-            self.ws_url,
-            additional_headers=additional_headers,
-            ping_interval=20,
-            ping_timeout=10,
-        ) as ws:
-            self.ws = ws
-            print("[bridge] Connected to control plane")
+        try:
+            async with websockets.connect(
+                self.ws_url,
+                additional_headers=additional_headers,
+                ping_interval=20,
+                ping_timeout=10,
+            ) as ws:
+                self.ws = ws
+                self.log.info("bridge.connect", outcome="success")
 
-            await self._send_event(
-                {
-                    "type": "ready",
-                    "sandboxId": self.sandbox_id,
-                    "opencodeSessionId": self.opencode_session_id,
-                }
-            )
+                await self._send_event(
+                    {
+                        "type": "ready",
+                        "sandboxId": self.sandbox_id,
+                        "opencodeSessionId": self.opencode_session_id,
+                    }
+                )
 
-            heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            background_tasks: set[asyncio.Task[None]] = set()
+                heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                background_tasks: set[asyncio.Task[None]] = set()
 
-            try:
-                async for message in ws:
-                    if self.shutdown_event.is_set():
-                        break
+                try:
+                    async for message in ws:
+                        if self.shutdown_event.is_set():
+                            break
 
-                    try:
-                        cmd = json.loads(message)
-                        task = await self._handle_command(cmd)
-                        if task:
-                            background_tasks.add(task)
-                            task.add_done_callback(background_tasks.discard)
-                    except json.JSONDecodeError as e:
-                        print(f"[bridge] Invalid message: {e}")
-                    except Exception as e:
-                        print(f"[bridge] Error handling command: {e}")
+                        try:
+                            cmd = json.loads(message)
+                            task = await self._handle_command(cmd)
+                            if task:
+                                background_tasks.add(task)
+                                task.add_done_callback(background_tasks.discard)
+                        except json.JSONDecodeError as e:
+                            self.log.warn("bridge.invalid_message", exc=e)
+                        except Exception as e:
+                            self.log.error("bridge.command_error", exc=e)
 
-            finally:
-                heartbeat_task.cancel()
-                for task in background_tasks:
-                    task.cancel()
-                self.ws = None
+                finally:
+                    heartbeat_task.cancel()
+                    for task in background_tasks:
+                        task.cancel()
+                    self.ws = None
+
+        except InvalidStatus as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in (401, 403, 404, 410):
+                raise SessionTerminatedError(
+                    f"Session rejected by control plane (HTTP {status})."
+                ) from e
+            raise
 
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeat events."""
@@ -347,10 +382,14 @@ class AgentBridge:
         event_type = event.get("type", "unknown")
 
         if not self.ws:
-            print(f"[bridge] Cannot send {event_type}: WebSocket is None")
+            self.log.debug("bridge.send_failed", event_type=event_type, reason="ws_none")
             return
         if self.ws.state != State.OPEN:
-            print(f"[bridge] Cannot send {event_type}: WebSocket state is {self.ws.state}")
+            self.log.debug(
+                "bridge.send_failed",
+                event_type=event_type,
+                reason=f"ws_state_{self.ws.state}",
+            )
             return
 
         event["sandboxId"] = self.sandbox_id
@@ -358,9 +397,8 @@ class AgentBridge:
 
         try:
             await self.ws.send(json.dumps(event))
-            print(f"[bridge] Sent event: {event_type}")
         except Exception as e:
-            print(f"[bridge] Failed to send {event_type} event: {e}")
+            self.log.error("bridge.send_error", event_type=event_type, exc=e)
 
     async def _handle_command(self, cmd: dict[str, Any]) -> asyncio.Task[None] | None:
         """Handle command from control plane.
@@ -371,7 +409,7 @@ class AgentBridge:
         Returns a Task for long-running commands, None for immediate commands.
         """
         cmd_type = cmd.get("type")
-        print(f"[bridge] Received command: {cmd_type}")
+        self.log.debug("bridge.command_received", cmd_type=cmd_type)
 
         if cmd_type == "prompt":
             message_id = cmd.get("messageId") or cmd.get("message_id", "unknown")
@@ -419,7 +457,7 @@ class AgentBridge:
         elif cmd_type == "getElementAtPoint":
             await self._handle_get_element_at_point(cmd)
         else:
-            print(f"[bridge] Unknown command type: {cmd_type}")
+            self.log.debug("bridge.unknown_command", cmd_type=cmd_type)
         return None
 
     async def _handle_prompt(self, cmd: dict[str, Any]) -> None:
@@ -428,14 +466,14 @@ class AgentBridge:
         content = cmd.get("content", "")
         model = cmd.get("model")
         author_data = cmd.get("author", {})
-        tool_policy = cmd.get("toolPolicy") or {}
-        allowed_tools: set[str] | None = None
-        if tool_policy.get("mode") == "allowlist":
-            allowed = tool_policy.get("allowedTools") or tool_policy.get("allowed_tools")
-            if isinstance(allowed, list) and allowed:
-                allowed_tools = {str(tool) for tool in allowed if tool}
+        start_time = time.time()
+        outcome = "success"
 
-        print(f"[bridge] Processing prompt {message_id} with model {model}, author={author_data}")
+        self.log.info(
+            "prompt.start",
+            message_id=message_id,
+            model=model,
+        )
 
         self._current_prompt_message_id = message_id
         try:
@@ -453,7 +491,7 @@ class AgentBridge:
                 await self._create_opencode_session()
 
             async for event in self._stream_opencode_response_sse(
-                message_id, content, model, allowed_tools
+                message_id, content, model, allowed_tools=None
             ):
                 await self._send_event(event)
 
@@ -466,7 +504,8 @@ class AgentBridge:
             )
 
         except Exception as e:
-            print(f"[bridge] Error processing prompt: {e}")
+            outcome = "error"
+            self.log.error("prompt.error", exc=e, message_id=message_id)
             await self._send_event(
                 {
                     "type": "execution_complete",
@@ -476,24 +515,34 @@ class AgentBridge:
                 }
             )
         finally:
-            self._current_prompt_message_id = None
+            duration_ms = int((time.time() - start_time) * 1000)
+            self.log.info(
+                "prompt.run",
+                message_id=message_id,
+                model=model,
+                outcome=outcome,
+                duration_ms=duration_ms,
+            )
 
     async def _create_opencode_session(self) -> None:
         """Create a new OpenCode session."""
-        print("[bridge] Creating OpenCode session...")
-
         if not self.http_client:
             raise RuntimeError("HTTP client not initialized")
 
         resp = await self.http_client.post(
             f"{self.opencode_base_url}/session",
             json={},
+            timeout=self.OPENCODE_REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json()
 
         self.opencode_session_id = data.get("id")
-        print(f"[bridge] Created OpenCode session: {self.opencode_session_id}")
+        self.log.info(
+            "opencode.session.ensure",
+            opencode_session_id=self.opencode_session_id,
+            action="created",
+        )
 
         await self._save_session_id()
 
@@ -516,14 +565,12 @@ class AgentBridge:
         elif part_type == "tool":
             state = part.get("state", {})
             status = state.get("status", "")
-            tool_name = part.get("tool", "")
-            call_id = (
-                part.get("callID")
-                or part.get("callId")
-                or state.get("callID")
-                or state.get("callId")
-                or part.get("id")
-                or ""
+            tool_input = state.get("input", {})
+
+            self.log.debug(
+                "bridge.tool_part",
+                tool=part.get("tool"),
+                status=status,
             )
             # OpenCode may put tool args in state.input, state.args, state.raw, or top-level part.input / part.args
             tool_input = (
@@ -548,48 +595,12 @@ class AgentBridge:
                     except (json.JSONDecodeError, TypeError):
                         pass
 
-            output = state.get("output", "")
-            if not output:
-                # Surface tool errors if output is empty
-                error_info = (
-                    state.get("error")
-                    or state.get("message")
-                    or part.get("error")
-                    or part.get("message")
-                    or part.get("result")
-                )
-                if isinstance(error_info, dict) and error_info.get("message"):
-                    output = error_info.get("message")
-                else:
-                    output = error_info or ""
-                if not output and status == "error":
-                    output = "Tool failed with no output (check sandbox logs)."
-            if output is None:
-                output = ""
-            elif isinstance(output, dict) and output.get("content"):
-                output = output.get("content")
-            elif not isinstance(output, str):
-                try:
-                    output = json.dumps(output)
-                except (TypeError, ValueError):
-                    output = str(output)
-            has_todos = isinstance(tool_input.get("todos"), list)
-            print(
-                f"[bridge] Tool part: tool={tool_name}, status={status}, "
-                f"input_keys={list(tool_input.keys()) if tool_input else 'empty'}, has_todos={has_todos}"
-            )
-            if status == "error" and output:
-                print(
-                    f"[bridge] Tool error output: {output[:500]}{'...' if len(output) > 500 else ''}"
-                )
-
-            # Skip only when we have no tool name and no args (avoid swallowing no-arg tools)
-            if not tool_name and status in ("pending", "") and not tool_input:
-                print(
-                    f"[bridge] Skipping tool_call (no input yet): part_keys={list(part.keys())}, "
-                    f"state_keys={list(state.keys()) if state else []}"
-                )
+            if status in ("pending", "") and not tool_input:
                 return None
+
+            tool_name = part.get("tool", "")
+            call_id = part.get("id") or state.get("id") or ""
+            output = state.get("output") or part.get("output") or ""
 
             return {
                 "type": "tool_call",
@@ -632,7 +643,6 @@ class AgentBridge:
 
         if opencode_message_id:
             request_body["messageID"] = opencode_message_id
-            print(f"[bridge] Building prompt request, messageID={opencode_message_id}")
 
         if model:
             if "/" in model:
@@ -649,6 +659,7 @@ class AgentBridge:
     async def _parse_sse_stream(
         self,
         response: httpx.Response,
+        timeout_ctx: asyncio.Timeout | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Parse Server-Sent Events stream from OpenCode.
 
@@ -658,10 +669,15 @@ class AgentBridge:
             data: {"type": "...", "properties": {...}}
 
         Events are separated by double newlines.
+        If timeout_ctx is provided, the deadline is reset on every chunk received.
         """
         buffer = ""
         async for chunk in response.aiter_text():
             buffer += chunk
+            if timeout_ctx is not None:
+                timeout_ctx.reschedule(
+                    asyncio.get_running_loop().time() + self.sse_inactivity_timeout
+                )
 
             # Process complete events (separated by double newlines)
             while "\n\n" in buffer:
@@ -683,7 +699,7 @@ class AgentBridge:
                         event = json.loads(raw_data)
                         yield event
                     except json.JSONDecodeError as e:
-                        print(f"[bridge] SSE JSON parse error: {e}")
+                        self.log.debug("bridge.sse_parse_error", exc=e)
 
     async def _stream_opencode_response_sse(
         self,
@@ -713,344 +729,274 @@ class AgentBridge:
         sse_url = f"{self.opencode_base_url}/event"
         async_url = f"{self.opencode_base_url}/session/{self.opencode_session_id}/prompt_async"
 
-        print(f"[bridge] Connecting to SSE endpoint: {sse_url}, messageID={opencode_message_id}")
-
         cumulative_text: dict[str, str] = {}
         emitted_tool_states: set[str] = set()
-        our_assistant_msg_ids: set[str] = set()
-        # Parts that arrived before we saw message.updated; flush when we see assistant msg
-        buffered_parts_by_msg_id: dict[str, list[dict[str, Any]]] = {}
-        policy_violation_triggered = False
+        allowed_assistant_msg_ids: set[str] = set()
+        pending_parts: dict[str, list[tuple[dict[str, Any], Any]]] = {}
+        pending_parts_total = 0
+        pending_drop_logged = False
 
-        max_wait_time = 600.0  # Increased from 300s to support longer-running agents
         start_time = time.time()
+        loop = asyncio.get_running_loop()
+
+        def buffer_part(oc_msg_id: str, part: dict[str, Any], delta: Any) -> None:
+            nonlocal pending_parts_total
+            nonlocal pending_drop_logged
+            if pending_parts_total >= self.MAX_PENDING_PART_EVENTS:
+                if not pending_drop_logged:
+                    self.log.warn(
+                        "bridge.pending_parts_dropped",
+                        message_id=message_id,
+                        limit=self.MAX_PENDING_PART_EVENTS,
+                    )
+                    pending_drop_logged = True
+                return
+            pending_parts.setdefault(oc_msg_id, []).append((part, delta))
+            pending_parts_total += 1
+
+        def handle_part(part: dict[str, Any], delta: Any) -> list[dict[str, Any]]:
+            part_type = part.get("type", "")
+            part_id = part.get("id", "")
+            events: list[dict[str, Any]] = []
+
+            if part_type == "text":
+                text = part.get("text", "")
+                if delta:
+                    cumulative_text[part_id] = cumulative_text.get(part_id, "") + delta
+                else:
+                    cumulative_text[part_id] = text
+
+                if cumulative_text.get(part_id):
+                    events.append(
+                        {
+                            "type": "token",
+                            "content": cumulative_text[part_id],
+                            "messageId": message_id,
+                        }
+                    )
+
+            elif part_type == "tool":
+                tool_event = self._transform_part_to_event(part, message_id)
+                if tool_event:
+                    state = part.get("state", {})
+                    status = state.get("status", "")
+                    call_id = part.get("callID", "")
+                    tool_key = f"tool:{call_id}:{status}"
+
+                    if tool_key not in emitted_tool_states:
+                        emitted_tool_states.add(tool_key)
+                        events.append(tool_event)
+
+            elif part_type == "step-start":
+                events.append(
+                    {
+                        "type": "step_start",
+                        "messageId": message_id,
+                    }
+                )
+
+            elif part_type == "step-finish":
+                events.append(
+                    {
+                        "type": "step_finish",
+                        "cost": part.get("cost"),
+                        "tokens": part.get("tokens"),
+                        "reason": part.get("reason"),
+                        "messageId": message_id,
+                    }
+                )
+
+            return events
 
         try:
-            async with asyncio.timeout(max_wait_time):
+            deadline = asyncio.get_running_loop().time() + self.sse_inactivity_timeout
+            async with asyncio.timeout_at(deadline) as timeout_ctx:
                 async with self.http_client.stream(
                     "GET",
                     sse_url,
-                    timeout=httpx.Timeout(max_wait_time, connect=30.0),
+                    timeout=httpx.Timeout(None, connect=self.HTTP_CONNECT_TIMEOUT, read=None),
                 ) as sse_response:
                     if sse_response.status_code != 200:
                         raise SSEConnectionError(
                             f"SSE connection failed: {sse_response.status_code}"
                         )
 
-                    print("[bridge] SSE connected, sending prompt...")
-
+                    prompt_start = loop.time()
                     prompt_response = await self.http_client.post(
                         async_url,
                         json=request_body,
-                        timeout=30.0,
+                        timeout=self.OPENCODE_REQUEST_TIMEOUT,
                     )
                     if prompt_response.status_code not in [200, 204]:
                         error_body = prompt_response.text
-                        print(f"[bridge] Prompt request body: {json.dumps(request_body)}")
-                        print(f"[bridge] Prompt error response: {error_body}")
+                        self.log.error(
+                            "bridge.prompt_request_error",
+                            status_code=prompt_response.status_code,
+                            error_body=error_body,
+                        )
                         raise RuntimeError(
                             f"Async prompt failed: {prompt_response.status_code} - {error_body}"
                         )
 
-                    print("[bridge] Prompt sent, processing SSE events...")
-
-                    async for event in self._parse_sse_stream(sse_response):
+                    async for event in self._parse_sse_stream(sse_response, timeout_ctx):
                         event_type = event.get("type")
                         props = event.get("properties", {})
 
                         if event_type == "server.connected":
-                            print("[bridge] SSE server.connected received")
-                            continue
+                            pass
+                        elif event_type != "server.heartbeat":
+                            event_session_id = props.get("sessionID") or props.get("part", {}).get(
+                                "sessionID"
+                            )
+                            if not event_session_id or event_session_id == self.opencode_session_id:
+                                if event_type == "message.updated":
+                                    info = props.get("info", {})
+                                    msg_session_id = info.get("sessionID")
+                                    if msg_session_id == self.opencode_session_id:
+                                        oc_msg_id = info.get("id", "")
+                                        parent_id = info.get("parentID", "")
+                                        role = info.get("role", "")
+                                        finish = info.get("finish", "")
 
-                        if event_type == "server.heartbeat":
-                            continue
+                                        self.log.debug(
+                                            "bridge.message_updated",
+                                            role=role,
+                                            oc_msg_id=oc_msg_id,
+                                            parent_match=(parent_id == opencode_message_id),
+                                        )
 
-                        event_session_id = props.get("sessionID") or props.get("part", {}).get(
-                            "sessionID"
-                        )
-                        if event_session_id and event_session_id != self.opencode_session_id:
-                            continue
+                                        if (
+                                            role == "assistant"
+                                            and parent_id == opencode_message_id
+                                            and oc_msg_id
+                                        ):
+                                            allowed_assistant_msg_ids.add(oc_msg_id)
+                                            pending = pending_parts.pop(oc_msg_id, [])
+                                            if pending:
+                                                pending_parts_total -= len(pending)
+                                                for part, delta in pending:
+                                                    for part_event in handle_part(part, delta):
+                                                        yield part_event
 
-                        if event_type == "message.updated":
-                            info = props.get("info", {})
-                            msg_session_id = info.get("sessionID")
-                            if msg_session_id == self.opencode_session_id:
-                                oc_msg_id = info.get("id", "")
-                                parent_id = info.get("parentID", "")
-                                role = info.get("role", "")
-                                finish = info.get("finish", "")
-
-                                print(
-                                    f"[bridge] message.updated: role={role}, id={oc_msg_id}, "
-                                    f"parentID={parent_id}, expected={opencode_message_id}, "
-                                    f"match={parent_id == opencode_message_id}"
-                                )
-
-                                if (
-                                    role == "assistant"
-                                    and parent_id == opencode_message_id
-                                    and oc_msg_id
-                                ):
-                                    our_assistant_msg_ids.add(oc_msg_id)
-                                    print(
-                                        f"[bridge] Tracking assistant message {oc_msg_id} "
-                                        f"(parentID matched)"
-                                    )
-                                    # Flush parts that arrived before this message.updated
-                                    for part in buffered_parts_by_msg_id.pop(oc_msg_id, []):
-                                        part_type = part.get("type", "")
-                                        part_id = part.get("id", "")
-                                        delta = part.get("delta")
-                                        if part_type == "text":
-                                            text = part.get("text", "")
-                                            if delta:
-                                                cumulative_text[part_id] = (
-                                                    cumulative_text.get(part_id, "") + delta
-                                                )
-                                            else:
-                                                cumulative_text[part_id] = text
-                                            if cumulative_text.get(part_id):
-                                                # Send heartbeat to control plane every 30s to prevent timeout
-                                                elapsed_since_heartbeat = time.time() - start_time
-                                                if (
-                                                    elapsed_since_heartbeat > 30
-                                                    and elapsed_since_heartbeat % 30 < 0.5
-                                                ):
-                                                    await self._send_event(
-                                                        {
-                                                            "type": "sse_heartbeat",
-                                                            "messageId": message_id,
-                                                        }
-                                                    )
-                                                yield {
-                                                    "type": "token",
-                                                    "content": cumulative_text[part_id],
-                                                    "messageId": message_id,
-                                                }
-                                        elif part_type == "tool":
-                                            tool_event = self._transform_part_to_event(
-                                                part, message_id
+                                        if finish and finish not in ("tool-calls", ""):
+                                            self.log.debug(
+                                                "bridge.message_finished",
+                                                finish=finish,
                                             )
-                                            if tool_event:
-                                                if (
-                                                    allowed_tools
-                                                    and not policy_violation_triggered
-                                                    and tool_event.get("tool")
-                                                    and tool_event.get("tool") not in allowed_tools
-                                                ):
-                                                    policy_violation_triggered = True
-                                                    allowed_list = ", ".join(sorted(allowed_tools))
-                                                    reason = (
-                                                        f"Tool '{tool_event.get('tool')}' is not allowed "
-                                                        f"for this request. Allowed tools: {allowed_list}."
-                                                    )
-                                                    print(
-                                                        f"[bridge] Tool policy violation: {reason}"
-                                                    )
-                                                    tool_event["status"] = "error"
-                                                    tool_event["output"] = reason
-                                                    yield tool_event
-                                                    await self._stop_opencode_execution()
-                                                    raise ToolPolicyError(reason)
-                                                status = tool_event.get("status", "")
-                                                call_id = tool_event.get("callId", "")
-                                                tool_key = f"tool:{call_id}:{status}"
-                                                if tool_key not in emitted_tool_states:
-                                                    emitted_tool_states.add(tool_key)
-                                                    yield tool_event
-                                        elif part_type == "step-start":
-                                            yield {
-                                                "type": "step_start",
-                                                "messageId": message_id,
-                                            }
-                                        elif part_type == "step-finish":
-                                            yield {
-                                                "type": "step_finish",
-                                                "cost": part.get("cost"),
-                                                "tokens": part.get("tokens"),
-                                                "reason": part.get("reason"),
-                                                "messageId": message_id,
-                                            }
 
-                                if finish and finish not in ("tool-calls", ""):
-                                    print(f"[bridge] SSE message finished (finish={finish})")
-                                # Discard buffered parts for user messages (never emit them)
-                                if role == "user" and oc_msg_id:
-                                    buffered_parts_by_msg_id.pop(oc_msg_id, None)
-                            continue
+                                elif event_type == "message.part.updated":
+                                    part = props.get("part", {})
+                                    delta = props.get("delta")
+                                    oc_msg_id = part.get("messageID", "")
+                                    if oc_msg_id in allowed_assistant_msg_ids:
+                                        for part_event in handle_part(part, delta):
+                                            yield part_event
+                                    elif oc_msg_id:
+                                        buffer_part(oc_msg_id, part, delta)
 
-                        if event_type == "message.part.updated":
-                            part = props.get("part", {})
-                            delta = props.get("delta")
-                            part_type = part.get("type", "")
-                            part_id = part.get("id", "")
-                            oc_msg_id = part.get("messageID", "")
-
-                            # Only emit parts from assistant messages; buffer until we know role
-                            if oc_msg_id not in our_assistant_msg_ids:
-                                # Enforce buffer size limit to prevent memory bloat
-                                total_buffered = sum(
-                                    len(parts) for parts in buffered_parts_by_msg_id.values()
-                                )
-                                if total_buffered < self.MAX_BUFFERED_PARTS:
-                                    buffered_parts_by_msg_id.setdefault(oc_msg_id, []).append(part)
-                                else:
-                                    print(
-                                        f"[bridge] Buffer full ({total_buffered} parts), "
-                                        f"dropping part for {oc_msg_id}"
-                                    )
-                                continue
-
-                            if part_type == "text":
-                                text = part.get("text", "")
-                                if delta:
-                                    cumulative_text[part_id] = (
-                                        cumulative_text.get(part_id, "") + delta
-                                    )
-                                else:
-                                    cumulative_text[part_id] = text
-
-                                if cumulative_text.get(part_id):
-                                    # Send heartbeat to control plane every 30s to prevent timeout
-                                    elapsed_since_heartbeat = time.time() - start_time
-                                    if (
-                                        elapsed_since_heartbeat > 30
-                                        and elapsed_since_heartbeat % 30 < 0.5
-                                    ):
-                                        await self._send_event(
-                                            {
-                                                "type": "sse_heartbeat",
-                                                "messageId": message_id,
-                                            }
+                                elif event_type == "session.idle":
+                                    idle_session_id = props.get("sessionID")
+                                    if idle_session_id == self.opencode_session_id:
+                                        elapsed = time.time() - start_time
+                                        self.log.debug(
+                                            "bridge.session_idle",
+                                            elapsed_s=round(elapsed, 1),
+                                            tracked_msgs=len(allowed_assistant_msg_ids),
                                         )
-                                    yield {
-                                        "type": "token",
-                                        "content": cumulative_text[part_id],
-                                        "messageId": message_id,
-                                    }
+                                        async for final_event in self._fetch_final_message_state(
+                                            message_id,
+                                            opencode_message_id,
+                                            cumulative_text,
+                                            allowed_assistant_msg_ids,
+                                        ):
+                                            yield final_event
+                                        return
 
-                            elif part_type == "tool":
-                                tool_event = self._transform_part_to_event(part, message_id)
-                                if tool_event:
+                                elif event_type == "session.status":
+                                    status_session_id = props.get("sessionID")
+                                    status = props.get("status", {})
                                     if (
-                                        allowed_tools
-                                        and not policy_violation_triggered
-                                        and tool_event.get("tool")
-                                        and tool_event.get("tool") not in allowed_tools
+                                        status_session_id == self.opencode_session_id
+                                        and status.get("type") == "idle"
                                     ):
-                                        policy_violation_triggered = True
-                                        allowed_list = ", ".join(sorted(allowed_tools))
-                                        reason = (
-                                            f"Tool '{tool_event.get('tool')}' is not allowed "
-                                            f"for this request. Allowed tools: {allowed_list}."
+                                        elapsed = time.time() - start_time
+                                        self.log.debug(
+                                            "bridge.session_status_idle",
+                                            elapsed_s=round(elapsed, 1),
+                                            tracked_msgs=len(allowed_assistant_msg_ids),
                                         )
-                                        print(f"[bridge] Tool policy violation: {reason}")
-                                        tool_event["status"] = "error"
-                                        tool_event["output"] = reason
-                                        yield tool_event
-                                        await self._stop_opencode_execution()
-                                        raise ToolPolicyError(reason)
-                                    status = tool_event.get("status", "")
-                                    call_id = tool_event.get("callId", "")
-                                    tool_key = f"tool:{call_id}:{status}"
+                                        async for final_event in self._fetch_final_message_state(
+                                            message_id,
+                                            opencode_message_id,
+                                            cumulative_text,
+                                            allowed_assistant_msg_ids,
+                                        ):
+                                            yield final_event
+                                        return
 
-                                    if tool_key not in emitted_tool_states:
-                                        emitted_tool_states.add(tool_key)
-                                        yield tool_event
+                                elif event_type == "session.error":
+                                    error_session_id = props.get("sessionID")
+                                    if error_session_id == self.opencode_session_id:
+                                        error = props.get("error", {})
+                                        error_msg = (
+                                            error.get("message")
+                                            if isinstance(error, dict)
+                                            else str(error)
+                                        )
+                                        self.log.error("bridge.session_error", error_msg=error_msg)
+                                        yield {
+                                            "type": "error",
+                                            "error": error_msg or "Unknown error",
+                                            "messageId": message_id,
+                                        }
+                                        return
 
-                            elif part_type == "step-start":
-                                yield {
-                                    "type": "step_start",
-                                    "messageId": message_id,
-                                }
-
-                            elif part_type == "step-finish":
-                                yield {
-                                    "type": "step_finish",
-                                    "cost": part.get("cost"),
-                                    "tokens": part.get("tokens"),
-                                    "reason": part.get("reason"),
-                                    "messageId": message_id,
-                                }
-
-                        elif event_type == "session.idle":
-                            idle_session_id = props.get("sessionID")
-                            if idle_session_id == self.opencode_session_id:
-                                elapsed = time.time() - start_time
-                                print(
-                                    f"[bridge] SSE session.idle received after {elapsed:.1f}s, "
-                                    f"fetching final state..."
-                                )
-                                print(
-                                    f"[bridge] Tracked {len(our_assistant_msg_ids)} assistant messages: "
-                                    f"{our_assistant_msg_ids}"
-                                )
-                                async for final_event in self._fetch_final_message_state(
-                                    message_id,
-                                    opencode_message_id,
-                                    cumulative_text,
-                                    our_assistant_msg_ids,
-                                ):
-                                    yield final_event
-                                return
-
-                        elif event_type == "session.status":
-                            status_session_id = props.get("sessionID")
-                            status = props.get("status", {})
-                            if (
-                                status_session_id == self.opencode_session_id
-                                and status.get("type") == "idle"
+                        if loop.time() > prompt_start + self.PROMPT_MAX_DURATION:
+                            elapsed = time.time() - start_time
+                            self.log.error(
+                                "bridge.prompt_max_duration_timeout",
+                                timeout_ms=int(self.PROMPT_MAX_DURATION * 1000),
+                                elapsed_ms=int(elapsed * 1000),
+                                message_id=message_id,
+                            )
+                            await self._request_opencode_stop(reason="prompt_max_duration_timeout")
+                            async for final_event in self._fetch_final_message_state(
+                                message_id,
+                                opencode_message_id,
+                                cumulative_text,
+                                allowed_assistant_msg_ids,
                             ):
-                                elapsed = time.time() - start_time
-                                print(
-                                    f"[bridge] SSE session.status idle received after {elapsed:.1f}s, "
-                                    f"fetching final state..."
-                                )
-                                print(
-                                    f"[bridge] Tracked {len(our_assistant_msg_ids)} assistant messages: "
-                                    f"{our_assistant_msg_ids}"
-                                )
-                                async for final_event in self._fetch_final_message_state(
-                                    message_id,
-                                    opencode_message_id,
-                                    cumulative_text,
-                                    our_assistant_msg_ids,
-                                ):
-                                    yield final_event
-                                return
-
-                        elif event_type == "session.error":
-                            error_session_id = props.get("sessionID")
-                            if error_session_id == self.opencode_session_id:
-                                error = props.get("error", {})
-                                error_msg = (
-                                    error.get("message") if isinstance(error, dict) else str(error)
-                                )
-                                print(f"[bridge] SSE session.error: {error_msg}")
-                                yield {
-                                    "type": "error",
-                                    "error": error_msg or "Unknown error",
-                                    "messageId": message_id,
-                                }
-                                return
+                                yield final_event
+                            raise RuntimeError(
+                                f"Prompt exceeded max duration of {self.PROMPT_MAX_DURATION:.0f}s."
+                            )
 
         except TimeoutError:
             elapsed = time.time() - start_time
-            print(
-                f"[bridge] SSE stream timed out after {elapsed:.1f}s, attempting polling fallback..."
+            self.log.error(
+                "bridge.sse_inactivity_timeout",
+                timeout_name="sse_inactivity",
+                timeout_ms=int(self.sse_inactivity_timeout * 1000),
+                elapsed_ms=int(elapsed * 1000),
+                operation="bridge.sse",
+                message_id=message_id,
             )
-            # Try polling fallback to recover remaining events
+            await self._request_opencode_stop(reason="inactivity_timeout")
+
             async for final_event in self._fetch_final_message_state(
                 message_id,
                 opencode_message_id,
                 cumulative_text,
-                our_assistant_msg_ids,
+                allowed_assistant_msg_ids,
             ):
                 yield final_event
-            return
+            raise RuntimeError(
+                f"SSE stream inactive for {self.sse_inactivity_timeout:.0f}s "
+                f"(no data received). Total elapsed: {elapsed:.0f}s"
+            )
 
         except httpx.ReadError as e:
-            print(f"[bridge] SSE read error: {e}")
+            self.log.error("bridge.sse_read_error", exc=e)
             raise SSEConnectionError(f"SSE read error: {e}")
 
     async def _fetch_final_message_state(
@@ -1081,30 +1027,24 @@ class AgentBridge:
         messages_url = f"{self.opencode_base_url}/session/{self.opencode_session_id}/message"
 
         try:
-            response = await self.http_client.get(messages_url, timeout=10.0)
+            response = await self.http_client.get(
+                messages_url,
+                timeout=self.OPENCODE_REQUEST_TIMEOUT,
+            )
             if response.status_code != 200:
-                print(f"[bridge] Final state fetch failed: {response.status_code}")
+                self.log.warn(
+                    "bridge.final_state_fetch_error",
+                    status_code=response.status_code,
+                )
                 return
 
             messages = response.json()
 
-            print(
-                f"[bridge] Final state fetch: got {len(messages)} messages, "
-                f"looking for parentID={opencode_message_id}"
-            )
-
-            matched_count = 0
             for msg in messages:
                 info = msg.get("info", {})
                 role = info.get("role", "")
                 msg_id = info.get("id", "")
                 parent_id = info.get("parentID", "")
-
-                if role == "assistant":
-                    print(
-                        f"[bridge] Assistant message: id={msg_id}, parentID={parent_id}, "
-                        f"match={parent_id == opencode_message_id}"
-                    )
 
                 if role != "assistant":
                     continue
@@ -1113,17 +1053,7 @@ class AgentBridge:
                 in_tracked_set = tracked_msg_ids and msg_id in tracked_msg_ids
 
                 if not parent_matches and not in_tracked_set:
-                    print(
-                        f"[bridge] Skipping message {msg_id}: "
-                        f"parentID={parent_id} != {opencode_message_id}, not in tracked set"
-                    )
                     continue
-
-                matched_count += 1
-                print(
-                    f"[bridge] Processing message {msg_id}: "
-                    f"parent_match={parent_matches}, in_tracked={in_tracked_set}"
-                )
 
                 parts = msg.get("parts", [])
                 for part in parts:
@@ -1134,9 +1064,10 @@ class AgentBridge:
                         text = part.get("text", "")
                         previously_sent = cumulative_text.get(part_id, "")
                         if len(text) > len(previously_sent):
-                            print(
-                                f"[bridge] Final fetch found additional text: "
-                                f"{len(previously_sent)} -> {len(text)} chars"
+                            self.log.debug(
+                                "bridge.final_text_update",
+                                prev_len=len(previously_sent),
+                                new_len=len(text),
                             )
                             cumulative_text[part_id] = text
                             yield {
@@ -1146,43 +1077,16 @@ class AgentBridge:
                             }
 
         except Exception as e:
-            print(f"[bridge] Error fetching final state: {e}")
+            self.log.error("bridge.final_state_error", exc=e)
 
     async def _handle_stop(self) -> None:
-        """Handle stop command - halt current execution and clear processing state."""
-        print("[bridge] Stopping current execution")
-
-        if self._prompt_task and not self._prompt_task.done():
-            self._prompt_task.cancel()
-
-        await self._stop_opencode_execution()
-
-        # Always send execution_complete so the control plane clears processing and the UI unlocks
-        current_id = self._current_prompt_message_id
-        if current_id:
-            await self._send_event(
-                {
-                    "type": "execution_complete",
-                    "messageId": current_id,
-                    "success": False,
-                    "error": "Stopped by user",
-                }
-            )
-            self._current_prompt_message_id = None
-
-    async def _stop_opencode_execution(self) -> None:
-        """Request OpenCode to stop current execution."""
-        if self.http_client and self.opencode_session_id:
-            try:
-                await self.http_client.post(
-                    f"{self.opencode_base_url}/session/{self.opencode_session_id}/stop",
-                )
-            except Exception as e:
-                print(f"[bridge] Error stopping execution: {e}")
+        """Handle stop command - halt current execution."""
+        self.log.info("bridge.stop")
+        await self._request_opencode_stop(reason="command")
 
     async def _handle_snapshot(self) -> None:
         """Handle snapshot command - prepare for snapshot."""
-        print("[bridge] Preparing for snapshot")
+        self.log.info("bridge.snapshot_prepare")
         await self._send_event(
             {
                 "type": "snapshot_ready",
@@ -1192,7 +1096,7 @@ class AgentBridge:
 
     async def _handle_shutdown(self) -> None:
         """Handle shutdown command - graceful shutdown."""
-        print("[bridge] Shutdown requested")
+        self.log.info("bridge.shutdown_requested")
         self.shutdown_event.set()
 
     def _resolve_github_token(self, cmd: dict[str, Any]) -> TokenResolution:
@@ -1220,13 +1124,17 @@ class AgentBridge:
         repo_name = cmd.get("repoName") or os.environ.get("REPO_NAME", "")
 
         github_token, token_source = self._resolve_github_token(cmd)
-        print(
-            f"[bridge] Pushing branch: {branch_name} to {repo_owner}/{repo_name} (token: {token_source})"
+        self.log.info(
+            "git.push_start",
+            branch_name=branch_name,
+            repo_owner=repo_owner,
+            repo_name=repo_name,
+            token_source=token_source,
         )
 
         repo_dirs = list(self.repo_path.glob("*/.git"))
         if not repo_dirs:
-            print("[bridge] No repository found, cannot push")
+            self.log.warn("git.push_error", reason="no_repository")
             await self._send_event(
                 {
                     "type": "push_error",
@@ -1241,7 +1149,7 @@ class AgentBridge:
             refspec = f"HEAD:refs/heads/{branch_name}"
 
             if not github_token or not repo_owner or not repo_name:
-                print("[bridge] Push failed: missing GitHub token or repository info")
+                self.log.warn("git.push_error", reason="missing_credentials")
                 await self._send_event(
                     {
                         "type": "push_error",
@@ -1254,7 +1162,6 @@ class AgentBridge:
             push_url = (
                 f"https://x-access-token:{github_token}@github.com/{repo_owner}/{repo_name}.git"
             )
-            print(f"[bridge] Pushing HEAD to {branch_name} via authenticated URL")
 
             result = await asyncio.create_subprocess_exec(
                 "git",
@@ -1267,11 +1174,10 @@ class AgentBridge:
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            _stdout, stderr = await result.communicate()
+            _stdout, _stderr = await result.communicate()
 
             if result.returncode != 0:
-                _error_msg = stderr.decode()  # Intentionally unused - may contain secrets
-                print("[bridge] Push failed (see event for details)")
+                self.log.warn("git.push_failed", branch_name=branch_name)
                 await self._send_event(
                     {
                         "type": "push_error",
@@ -1280,7 +1186,7 @@ class AgentBridge:
                     }
                 )
             else:
-                print("[bridge] Push successful")
+                self.log.info("git.push_complete", branch_name=branch_name)
                 await self._send_event(
                     {
                         "type": "push_complete",
@@ -1289,7 +1195,7 @@ class AgentBridge:
                 )
 
         except Exception as e:
-            print(f"[bridge] Push error: {e}")
+            self.log.error("git.push_error", exc=e, branch_name=branch_name)
             await self._send_event(
                 {
                     "type": "push_error",
@@ -1401,7 +1307,7 @@ class AgentBridge:
                 page = await self._ensure_element_at_point_page(
                     preview_url, viewport_width, viewport_height, device_scale_factor
                 )
-                element = await page.evaluate(GET_ELEMENT_AT_POINT_SCRIPT, [int(x), int(y)])
+                element = await page.evaluate(GET_ELEMENT_SCRIPT, [int(x), int(y)])
             except Exception as e:
                 print(f"[bridge] getElementAtPoint error: {e}")
                 await self._send_event(
@@ -1429,11 +1335,11 @@ class AgentBridge:
 
     async def _configure_git_identity(self, user: GitUser) -> None:
         """Configure git identity for commit attribution."""
-        print(f"[bridge] Configuring git identity: {user.name} <{user.email}>")
+        self.log.debug("git.identity_configure", git_name=user.name, git_email=user.email)
 
         repo_dirs = list(self.repo_path.glob("*/.git"))
         if not repo_dirs:
-            print("[bridge] No repository found, skipping git config")
+            self.log.debug("git.identity_skip", reason="no_repository")
             return
 
         repo_dir = repo_dirs[0].parent
@@ -1450,28 +1356,36 @@ class AgentBridge:
                 check=True,
             )
         except subprocess.CalledProcessError as e:
-            print(f"[bridge] Failed to configure git identity: {e}")
+            self.log.error("git.identity_error", exc=e)
 
     async def _load_session_id(self) -> None:
         """Load OpenCode session ID from file if it exists."""
         if self.session_id_file.exists():
             try:
                 self.opencode_session_id = self.session_id_file.read_text().strip()
-                print(f"[bridge] Loaded existing session ID: {self.opencode_session_id}")
+                self.log.info(
+                    "opencode.session.ensure",
+                    opencode_session_id=self.opencode_session_id,
+                    action="loaded",
+                )
 
                 if self.http_client:
                     try:
                         resp = await self.http_client.get(
-                            f"{self.opencode_base_url}/session/{self.opencode_session_id}"
+                            f"{self.opencode_base_url}/session/{self.opencode_session_id}",
+                            timeout=self.OPENCODE_REQUEST_TIMEOUT,
                         )
                         if resp.status_code != 200:
-                            print("[bridge] Existing session invalid, will create new one")
+                            self.log.info(
+                                "opencode.session.invalid",
+                                opencode_session_id=self.opencode_session_id,
+                            )
                             self.opencode_session_id = None
                     except Exception:
                         self.opencode_session_id = None
 
             except Exception as e:
-                print(f"[bridge] Failed to load session ID: {e}")
+                self.log.error("opencode.session.load_error", exc=e)
 
     async def _save_session_id(self) -> None:
         """Save OpenCode session ID to file for persistence."""
@@ -1479,7 +1393,70 @@ class AgentBridge:
             try:
                 self.session_id_file.write_text(self.opencode_session_id)
             except Exception as e:
-                print(f"[bridge] Failed to save session ID: {e}")
+                self.log.error("opencode.session.save_error", exc=e)
+
+    async def _request_opencode_stop(self, reason: str) -> bool:
+        if not self.http_client or not self.opencode_session_id:
+            return False
+
+        try:
+            await self.http_client.post(
+                f"{self.opencode_base_url}/session/{self.opencode_session_id}/stop",
+                timeout=self.OPENCODE_REQUEST_TIMEOUT,
+            )
+            self.log.info("bridge.stop_requested", reason=reason)
+            return True
+        except Exception as e:
+            self.log.warn("bridge.stop_request_error", exc=e, reason=reason)
+            return False
+
+    def _resolve_timeout_seconds(
+        self,
+        name: str,
+        default: float,
+        min_value: float,
+        max_value: float,
+    ) -> float:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            value = default
+        else:
+            try:
+                value = float(raw)
+            except ValueError:
+                self.log.warn(
+                    "bridge.timeout_invalid",
+                    timeout_name=name,
+                    timeout_ms=int(default * 1000),
+                    detail=f"invalid value '{raw}', using default",
+                )
+                value = default
+
+        if value < min_value:
+            self.log.warn(
+                "bridge.timeout_clamped",
+                timeout_name=name,
+                timeout_ms=int(min_value * 1000),
+                detail=f"below min ({min_value}s), clamped",
+            )
+            value = min_value
+        elif value > max_value:
+            self.log.warn(
+                "bridge.timeout_clamped",
+                timeout_name=name,
+                timeout_ms=int(max_value * 1000),
+                detail=f"above max ({max_value}s), clamped",
+            )
+            value = max_value
+
+        self.log.info(
+            "bridge.timeout_config",
+            timeout_name=name,
+            timeout_ms=int(value * 1000),
+            min_ms=int(min_value * 1000),
+            max_ms=int(max_value * 1000),
+        )
+        return value
 
 
 async def main():

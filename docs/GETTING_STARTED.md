@@ -12,11 +12,11 @@ This guide walks you through deploying your own instance of Open-Inspect using T
 
 Open-Inspect uses Terraform to automate deployment across three cloud providers:
 
-| Provider       | Purpose                          | What Terraform Creates                  |
-| -------------- | -------------------------------- | --------------------------------------- |
-| **Cloudflare** | Control plane, session state     | Workers, KV namespaces, Durable Objects |
-| **Vercel**     | Web application                  | Project, environment variables          |
-| **Modal**      | Sandbox execution infrastructure | App deployment, secrets, volumes        |
+| Provider       | Purpose                          | What Terraform Creates                               |
+| -------------- | -------------------------------- | ---------------------------------------------------- |
+| **Cloudflare** | Control plane, session state     | Workers, KV namespaces, Durable Objects, D1 Database |
+| **Vercel**     | Web application                  | Project, environment variables                       |
+| **Modal**      | Sandbox execution infrastructure | App deployment, secrets, volumes                     |
 
 **Your job**: Create accounts, gather credentials, and configure one file (`terraform.tfvars`).
 **Terraform's job**: Create all infrastructure and configure services.
@@ -83,7 +83,7 @@ npm run build -w @open-inspect/shared
    of the panel for `*.YOUR-SUBDOMAIN.workers.dev`
 4. **Create API Token** at [API Tokens](https://dash.cloudflare.com/profile/api-tokens):
    - Use template: "Edit Cloudflare Workers"
-   - Add permissions: Workers KV Storage (Edit), Workers R2 Storage (Edit)
+   - Add permissions: Workers KV Storage (Edit), Workers R2 Storage (Edit), D1 (Edit)
 
 ### Cloudflare R2 (Terraform State Backend)
 
@@ -197,6 +197,9 @@ Skip this step if you don't need Slack integration.
    - `app_mentions:read`
    - `chat:write`
    - `channels:history`
+   - `channels:read`
+   - `groups:history`
+   - `groups:read`
 3. Click **"Install to Workspace"**
 4. Note the **Bot Token** (`xoxb-...`)
 
@@ -222,6 +225,9 @@ Generate these random secrets (you'll need them for `terraform.tfvars`):
 ```bash
 # Token encryption key
 echo "token_encryption_key: $(openssl rand -base64 32)"
+
+# Repo secrets encryption key
+echo "repo_secrets_encryption_key: $(openssl rand -base64 32)"
 
 # Internal callback secret
 echo "internal_callback_secret: $(openssl rand -base64 32)"
@@ -294,8 +300,9 @@ slack_signing_secret = ""
 anthropic_api_key = "sk-ant-..."
 
 # Security Secrets (from Step 5)
-token_encryption_key     = "your-generated-value"
-internal_callback_secret = "your-generated-value"
+token_encryption_key          = "your-generated-value"
+repo_secrets_encryption_key   = "your-generated-value"
+internal_callback_secret      = "your-generated-value"
 modal_api_secret         = "your-generated-value"
 nextauth_secret          = "your-generated-value"
 
@@ -512,7 +519,8 @@ Go to your fork's Settings → Secrets and variables → Actions, and add:
 | `SLACK_BOT_TOKEN`             | Slack bot token (or empty)                                                   |
 | `SLACK_SIGNING_SECRET`        | Slack signing secret (or empty)                                              |
 | `ANTHROPIC_API_KEY`           | Anthropic API key                                                            |
-| `TOKEN_ENCRYPTION_KEY`        | Generated encryption key                                                     |
+| `TOKEN_ENCRYPTION_KEY`        | Generated encryption key (OAuth tokens)                                      |
+| `REPO_SECRETS_ENCRYPTION_KEY` | Generated encryption key (repo secrets)                                      |
 | `INTERNAL_CALLBACK_SECRET`    | Generated callback secret                                                    |
 | `MODAL_API_SECRET`            | Generated Modal API secret                                                   |
 | `NEXTAUTH_SECRET`             | Generated NextAuth secret                                                    |
@@ -598,6 +606,18 @@ ls packages/slack-bot/dist/index.js
 2. Ensure the bot is invited to the channel (`/invite @BotName`)
 3. Check that you're @mentioning the bot in your message
 4. If you updated bot token scopes, reinstall the app to your workspace
+
+### Slack bot ignores thread context
+
+If the bot doesn't see the original message when tagged in a thread reply:
+
+1. Verify the bot has `channels:history` scope (for public channels) and `groups:history` (for
+   private channels). These are required by the `conversations.replies` API to fetch thread
+   messages.
+2. Verify the bot has `channels:read` and `groups:read` scopes. These are required by
+   `conversations.info` to fetch channel name and description for context.
+3. If you added missing scopes, **reinstall the app** to your workspace for the new permissions to
+   take effect.
 
 ### Durable Objects / Service Binding errors
 
