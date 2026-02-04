@@ -1378,19 +1378,37 @@ export class SessionDO extends DurableObject<Env> {
       return;
     }
 
+    // Prevent concurrent spawn/restore (typing + prompt can both trigger; restore path didn't set this)
+    if (this.isSpawningSandbox) {
+      console.log("[DO] spawnSandbox: isSpawningSandbox=true, skipping");
+      return;
+    }
+
     // Check if we have a snapshot to restore from
     if (
       snapshotImageId &&
       (currentStatus === "stopped" || currentStatus === "stale" || currentStatus === "failed")
     ) {
       console.log(`[DO] Found snapshot ${snapshotImageId}, restoring instead of fresh spawn`);
-      await this.sandboxManager!.restoreFromSnapshot(snapshotImageId);
-      this.sandboxManager!.updateStatus("connecting");
-      this.broadcast({ type: "sandbox_status", status: "connecting" });
-      this.broadcast({
-        type: "sandbox_restored",
-        message: "Session restored from snapshot",
-      });
+      this.isSpawningSandbox = true;
+      try {
+        await this.sandboxManager!.restoreFromSnapshot(snapshotImageId);
+        this.sandboxManager!.updateStatus("connecting");
+        this.broadcast({ type: "sandbox_status", status: "connecting" });
+        this.broadcast({
+          type: "sandbox_restored",
+          message: "Session restored from snapshot",
+        });
+      } catch (error) {
+        console.error("Failed to restore sandbox:", error);
+        this.sandboxManager!.updateStatus("failed");
+        this.broadcast({
+          type: "sandbox_error",
+          error: error instanceof Error ? error.message : "Failed to restore sandbox",
+        });
+      } finally {
+        this.isSpawningSandbox = false;
+      }
       return;
     }
 
@@ -2843,13 +2861,15 @@ export class SessionDO extends DurableObject<Env> {
     }
 
     // Store status, auth token, and expected sandbox ID BEFORE calling Modal
-    // This prevents race conditions where sandbox connects before we've stored expected ID
+    // Clear tunnel URLs to avoid returning stale/dead links from previous sandbox
     this.sql.exec(
       `UPDATE sandbox SET
          status = 'spawning',
          created_at = ?,
          auth_token = ?,
-         modal_sandbox_id = ?
+         modal_sandbox_id = ?,
+         preview_tunnel_url = NULL,
+         tunnel_urls = NULL
        WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
       now,
       sandboxAuthToken,
@@ -2925,12 +2945,15 @@ export class SessionDO extends DurableObject<Env> {
       `https://open-inspect-control-plane.${this.env.CF_ACCOUNT_ID || "workers"}.workers.dev`;
 
     // Store status, auth token, and expected sandbox ID BEFORE calling Modal
+    // Clear tunnel URLs to avoid returning stale/dead links from previous sandbox
     this.sql.exec(
       `UPDATE sandbox SET
          status = 'spawning',
          created_at = ?,
          auth_token = ?,
-         modal_sandbox_id = ?
+         modal_sandbox_id = ?,
+         preview_tunnel_url = NULL,
+         tunnel_urls = NULL
        WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
       now,
       sandboxAuthToken,
@@ -3012,6 +3035,7 @@ export class SessionDO extends DurableObject<Env> {
           type: "preview",
           url: result.previewTunnelUrl,
           metadata,
+          createdAt: now,
         },
       });
     }

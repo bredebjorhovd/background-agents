@@ -23,8 +23,8 @@ SANDBOX_DIR = Path(__file__).parent.parent / "sandbox"
 OPENCODE_VERSION = "latest"
 
 # Cache buster - change this to force Modal image rebuild
-# v38: start-preview returns plain string (plugin expects string, not {content})
-CACHE_BUSTER = "v39-start-preview-string-return"
+# v39: fix dead preview links - clear stale tunnel URLs on spawn, retry tunnel fetch
+CACHE_BUSTER = "v40-dead-preview-link-fix"
 
 # code-server version to install
 CODE_SERVER_VERSION = "4.96.2"

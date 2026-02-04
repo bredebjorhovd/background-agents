@@ -437,7 +437,11 @@ async def api_restore_sandbox(
             "success": True,
             "data": {
                 "sandbox_id": handle.sandbox_id,
+                "modal_object_id": handle.modal_object_id,
                 "status": handle.status.value,
+                "created_at": handle.created_at,
+                "preview_tunnel_url": handle.preview_tunnel_url,
+                "tunnel_urls": handle.tunnel_urls,
             },
         }
     except HTTPException:

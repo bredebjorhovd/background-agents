@@ -555,7 +555,9 @@ Just call this tool and it handles everything - no need to manually configure or
       `**Framework:** ${projectType.framework || "Unknown"}`,
       `**Port:** ${projectType.port}`,
       `**Local URL:** http://localhost:${projectType.port}`,
-      previewUrl ? `**Live Preview URL:** ${previewUrl}` : "",
+      previewUrl
+        ? `**Live Preview URL:** ${previewUrl}`
+        : `**Live Preview URL:** Not available yet. The tunnel may still be starting—try "Start the preview again" in a moment.`,
       ``,
       `**Steps completed:**`,
       ...steps.map((s) => `- ${s.step}: ${s.result}`),

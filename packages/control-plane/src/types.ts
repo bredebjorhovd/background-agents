@@ -122,6 +122,7 @@ export type ServerMessage =
         url: string;
         prNumber?: number;
         metadata?: Record<string, unknown>;
+        createdAt?: number;
       };
     }
   | { type: "snapshot_saved"; imageId: string; reason: string }

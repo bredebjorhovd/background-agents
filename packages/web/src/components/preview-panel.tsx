@@ -3,6 +3,18 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { Artifact } from "@/types/session";
 
+/** Fetch live preview URL from control plane (source of truth, always current after restore) */
+async function fetchLivePreviewUrl(sessionId: string, port = 5173): Promise<string | null> {
+  try {
+    const res = await fetch(`/api/sessions/${sessionId}/preview-url?port=${port}`);
+    if (!res.ok) return null;
+    const data = (await res.json()) as { url?: string | null };
+    return data?.url && typeof data.url === "string" ? data.url : null;
+  } catch {
+    return null;
+  }
+}
+
 export interface SelectedElementInfo {
   selector: string;
   tagName: string;
@@ -22,11 +34,18 @@ interface PreviewPanelProps {
   artifacts: Artifact[];
   sessionId: string;
   onSelectElement?: (element: SelectedElementInfo) => void;
+  /** Increment to force refetch of live preview URL (e.g. when start-preview tool completes) */
+  refetchTrigger?: number;
 }
 
 const HOVER_THROTTLE_MS = 60;
 
-export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewPanelProps) {
+export function PreviewPanel({
+  artifacts,
+  sessionId,
+  onSelectElement,
+  refetchTrigger = 0,
+}: PreviewPanelProps) {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [iframeKey, setIframeKey] = useState(0);
@@ -41,20 +60,65 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
   const hoverPointRef = useRef<{ x: number; y: number } | null>(null);
   const remoteViewportRef = useRef<{ width: number; height: number } | null>(null);
 
-  // Find the preview artifact
-  const previewArtifact = artifacts.find((a) => a.type === "preview");
-  const previewUrl = previewArtifact?.url;
+  // Find the latest preview artifact (fallback when API returns nothing)
+  const previewArtifact = artifacts
+    .filter((a) => a.type === "preview")
+    .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))[0];
+  const artifactUrl = previewArtifact?.url ?? null;
+
+  // Fetch live URL from control plane – source of truth, always current after sandbox restore
+  const [livePreviewUrl, setLivePreviewUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!sessionId || !previewArtifact) {
+      setLivePreviewUrl(null);
+      return;
+    }
+    let cancelled = false;
+    const doFetch = () => {
+      fetchLivePreviewUrl(sessionId, 5173).then((url) => {
+        if (!cancelled) setLivePreviewUrl(url);
+      });
+    };
+    doFetch();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, previewArtifact?.id, previewArtifact, refetchTrigger]);
+
+  // Poll for live URL when we have a preview (catches start-preview completion)
+  useEffect(() => {
+    if (!sessionId || !previewArtifact) return;
+    const interval = setInterval(() => {
+      fetchLivePreviewUrl(sessionId, 5173).then((url) => {
+        if (url) setLivePreviewUrl((prev) => (prev !== url ? url : prev));
+      });
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [sessionId, previewArtifact?.id, previewArtifact]);
+
+  // Use live URL when available (correct after restore), else artifact URL
+  const previewUrl = livePreviewUrl ?? artifactUrl;
+  const isModalTunnel = previewUrl?.includes("modal.host") ?? false;
   const hoveredLabel =
     hoveredElement?.react?.name ??
     hoveredElement?.tagName ??
     hoveredElement?.selector ??
     (hoveredRect ? "Unknown element" : null);
 
+  const refetchLiveUrl = useCallback(() => {
+    if (sessionId && previewArtifact) {
+      fetchLivePreviewUrl(sessionId, 5173).then((url) => {
+        if (url) setLivePreviewUrl(url);
+      });
+    }
+  }, [sessionId, previewArtifact]);
+
   const handleRefresh = useCallback(() => {
+    refetchLiveUrl();
     setIframeKey((k) => k + 1);
     setIsLoading(true);
     setError(null);
-  }, []);
+  }, [refetchLiveUrl]);
 
   const handleIframeLoad = useCallback(() => {
     setIsLoading(false);
@@ -256,44 +320,57 @@ export function PreviewPanel({ artifacts, sessionId, onSelectElement }: PreviewP
   return (
     <div className="flex flex-col h-full">
       {/* Toolbar */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border-muted bg-muted/30">
-        <div className="flex items-center gap-2 min-w-0">
-          <GlobeIcon className="w-4 h-4 text-muted-foreground flex-shrink-0" />
-          <span className="text-sm text-muted-foreground truncate">{previewUrl}</span>
-        </div>
-        <div className="flex items-center gap-2 flex-shrink-0">
-          {onSelectElement && (
+      <div className="flex flex-col gap-1 border-b border-border-muted bg-muted/30">
+        <div className="flex items-center justify-between px-4 py-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <GlobeIcon className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+            <span className="text-sm text-muted-foreground truncate">{previewUrl}</span>
+          </div>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {onSelectElement && (
+              <button
+                type="button"
+                onClick={() => setIsSelecting((s) => !s)}
+                className={`flex items-center gap-1.5 px-2.5 py-1.5 text-sm rounded transition-colors ${
+                  isSelecting
+                    ? "bg-accent text-accent-foreground"
+                    : "hover:bg-muted text-muted-foreground"
+                }`}
+                title={isSelecting ? "Click an element in the preview" : "Select a React component"}
+              >
+                <CursorIcon className="w-4 h-4" />
+                {isSelecting ? "Click element…" : "Select"}
+              </button>
+            )}
             <button
-              type="button"
-              onClick={() => setIsSelecting((s) => !s)}
-              className={`flex items-center gap-1.5 px-2.5 py-1.5 text-sm rounded transition-colors ${
-                isSelecting
-                  ? "bg-accent text-accent-foreground"
-                  : "hover:bg-muted text-muted-foreground"
-              }`}
-              title={isSelecting ? "Click an element in the preview" : "Select a React component"}
+              onClick={handleRefresh}
+              className="p-1.5 hover:bg-muted rounded transition-colors"
+              title="Refresh preview"
             >
-              <CursorIcon className="w-4 h-4" />
-              {isSelecting ? "Click element…" : "Select"}
+              <RefreshIcon className="w-4 h-4 text-muted-foreground" />
             </button>
-          )}
-          <button
-            onClick={handleRefresh}
-            className="p-1.5 hover:bg-muted rounded transition-colors"
-            title="Refresh preview"
-          >
-            <RefreshIcon className="w-4 h-4 text-muted-foreground" />
-          </button>
+            <a
+              href={previewUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="p-1.5 hover:bg-muted rounded transition-colors"
+              title="Open in new tab"
+            >
+              <ExternalLinkIcon className="w-4 h-4 text-muted-foreground" />
+            </a>
+          </div>
+        </div>
+        {isModalTunnel && (
           <a
             href={previewUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="p-1.5 hover:bg-muted rounded transition-colors"
-            title="Open in new tab"
+            className="mx-4 mb-2 px-3 py-1.5 text-sm font-medium bg-accent/80 hover:bg-accent text-accent-foreground rounded transition-colors flex items-center gap-2 w-fit"
           >
-            <ExternalLinkIcon className="w-4 h-4 text-muted-foreground" />
+            <ExternalLinkIcon className="w-4 h-4" />
+            Open preview in new tab
           </a>
-        </div>
+        )}
       </div>
 
       {/* Preview iframe container */}

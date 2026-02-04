@@ -179,6 +179,25 @@ export default function SessionPage() {
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
 
+  // Trigger Preview panel to refetch live URL when start-preview tool completes
+  const [previewUrlRefetchTrigger, setPreviewUrlRefetchTrigger] = useState(0);
+  const lastStartPreviewCallIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const completed = events.filter(
+      (e) =>
+        e.type === "tool_call" &&
+        (e as { tool?: string }).tool === "start-preview" &&
+        ((e as { output?: string }).output || (e as { result?: string }).result)
+    );
+    const latest = completed[completed.length - 1] as
+      | { callId?: string; output?: string; result?: string }
+      | undefined;
+    if (latest?.callId && latest.callId !== lastStartPreviewCallIdRef.current) {
+      lastStartPreviewCallIdRef.current = latest.callId;
+      setPreviewUrlRefetchTrigger((t) => t + 1);
+    }
+  }, [events]);
+
   // Auto-switch to preview tab when preview artifact becomes available
   const previewArtifact = artifacts.find((a) => a.type === "preview");
   const prevPreviewUrlRef = useRef<string | null>(null);
@@ -289,6 +308,7 @@ export default function SessionPage() {
         handleUnarchive={handleUnarchive}
         selectedElement={selectedElement}
         setSelectedElement={setSelectedElement}
+        previewUrlRefetchTrigger={previewUrlRefetchTrigger}
       />
     </SidebarLayout>
   );
@@ -325,6 +345,7 @@ function SessionContent({
   handleUnarchive,
   selectedElement,
   setSelectedElement,
+  previewUrlRefetchTrigger,
 }: {
   sessionId: string;
   sessionState: ReturnType<typeof useSessionSocket>["sessionState"];
@@ -356,6 +377,7 @@ function SessionContent({
   handleUnarchive: () => void;
   selectedElement: SelectedElementInfo | null;
   setSelectedElement: (el: SelectedElementInfo | null) => void;
+  previewUrlRefetchTrigger: number;
 }) {
   const { isOpen, toggle } = useSidebarContext();
 
@@ -506,6 +528,7 @@ function SessionContent({
               artifacts={artifacts}
               sessionId={sessionId}
               onSelectElement={setSelectedElement}
+              refetchTrigger={previewUrlRefetchTrigger}
             />
           </div>
         ) : (

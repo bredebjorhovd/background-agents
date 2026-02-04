@@ -154,24 +154,30 @@ class SandboxManager:
             f"[manager] Created sandbox: sandbox_id={sandbox_id}, modal_object_id={modal_object_id}"
         )
 
-        # Get tunnel URLs for all exposed ports
+        # Get tunnel URLs for all exposed ports (retry - tunnels may not be ready immediately)
         preview_tunnel_url = None
         tunnel_urls: dict[int, str] = {}
-        try:
-            tunnels = sandbox.tunnels()
-            for port in PREVIEW_PORTS:
-                if port in tunnels:
-                    tunnel_urls[port] = tunnels[port].url
-                    print(f"[manager] Tunnel URL for port {port}: {tunnels[port].url}")
-            # Primary preview URL (backwards compatibility)
-            if PREVIEW_PORT in tunnel_urls:
-                preview_tunnel_url = tunnel_urls[PREVIEW_PORT]
-            elif tunnel_urls:
-                # Fallback to first available
-                preview_tunnel_url = next(iter(tunnel_urls.values()))
-            print(f"[manager] Available tunnel ports: {list(tunnel_urls.keys())}")
-        except Exception as e:
-            print(f"[manager] Failed to get tunnel URLs: {e}")
+        for attempt in range(3):
+            try:
+                tunnels = sandbox.tunnels(timeout=60)
+                for port in PREVIEW_PORTS:
+                    if port in tunnels:
+                        tunnel_urls[port] = tunnels[port].url
+                        print(f"[manager] Tunnel URL for port {port}: {tunnels[port].url}")
+                # Primary preview URL (backwards compatibility)
+                if PREVIEW_PORT in tunnel_urls:
+                    preview_tunnel_url = tunnel_urls[PREVIEW_PORT]
+                elif tunnel_urls:
+                    preview_tunnel_url = next(iter(tunnel_urls.values()))
+                if tunnel_urls:
+                    print(f"[manager] Available tunnel ports: {list(tunnel_urls.keys())}")
+                    break
+            except Exception as e:
+                print(f"[manager] Tunnel fetch attempt {attempt + 1}/3 failed: {e}")
+                if attempt < 2:
+                    time.sleep(5)
+        if not tunnel_urls:
+            print("[manager] WARNING: No tunnel URLs available - preview links will not work")
 
         return SandboxHandle(
             sandbox_id=sandbox_id,
@@ -366,21 +372,30 @@ class SandboxManager:
             f"(image={snapshot_image_id}, object_id={modal_object_id})"
         )
 
-        # Get tunnel URLs for restored sandbox
+        # Get tunnel URLs for restored sandbox (retry - tunnels may not be ready immediately)
         preview_tunnel_url = None
         tunnel_urls: dict[int, str] = {}
-        try:
-            tunnels = sandbox.tunnels()
-            for port in PREVIEW_PORTS:
-                if port in tunnels:
-                    tunnel_urls[port] = tunnels[port].url
-            if PREVIEW_PORT in tunnel_urls:
-                preview_tunnel_url = tunnel_urls[PREVIEW_PORT]
-            elif tunnel_urls:
-                preview_tunnel_url = next(iter(tunnel_urls.values()))
-            print(f"[manager] Restored sandbox tunnel ports: {list(tunnel_urls.keys())}")
-        except Exception as e:
-            print(f"[manager] Failed to get tunnel URLs for restored sandbox: {e}")
+        for attempt in range(3):
+            try:
+                tunnels = sandbox.tunnels(timeout=60)
+                for port in PREVIEW_PORTS:
+                    if port in tunnels:
+                        tunnel_urls[port] = tunnels[port].url
+                if PREVIEW_PORT in tunnel_urls:
+                    preview_tunnel_url = tunnel_urls[PREVIEW_PORT]
+                elif tunnel_urls:
+                    preview_tunnel_url = next(iter(tunnel_urls.values()))
+                if tunnel_urls:
+                    print(f"[manager] Restored sandbox tunnel ports: {list(tunnel_urls.keys())}")
+                    break
+            except Exception as e:
+                print(f"[manager] Restore tunnel fetch attempt {attempt + 1}/3 failed: {e}")
+                if attempt < 2:
+                    time.sleep(5)
+        if not tunnel_urls:
+            print(
+                "[manager] WARNING: No tunnel URLs for restored sandbox - preview links will not work"
+            )
 
         return SandboxHandle(
             sandbox_id=sandbox_id,
