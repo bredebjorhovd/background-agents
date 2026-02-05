@@ -14,8 +14,6 @@ import {
   isSandboxAuthRoute,
   verifySandboxAuth,
   requireInternalAuth,
-  getCorsOrigin,
-  applyCorsHeaders,
   // Session handlers
   handleListSessions,
   handleCreateSession,
@@ -49,6 +47,7 @@ import {
   handleUpdateRepoMetadata,
   handleGetRepoMetadata,
 } from "./routes";
+import { getCorsOrigin, applyCorsHeaders } from "./middleware";
 
 /**
  * Route configuration.
