@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
 import { getCorsOrigin } from "./middleware";
-import { CreateSessionRequestSchema } from "./schemas/session";
 import type { Env } from "./types";
 
 describe("security", () => {
@@ -40,28 +39,6 @@ describe("security", () => {
 
       const devEnv = { ...baseEnv, DEPLOYMENT_NAME: "development" } as Env;
       expect(getCorsOrigin(request, devEnv)).toBe("http://localhost:5173");
-    });
-  });
-
-  describe("input validation", () => {
-    it("rejects invalid repo owner", () => {
-      const invalid = {
-        repoOwner: "-octo",
-        repoName: "hello-world",
-      };
-
-      const result = CreateSessionRequestSchema.safeParse(invalid);
-      expect(result.success).toBe(false);
-    });
-
-    it("rejects invalid repo name", () => {
-      const invalid = {
-        repoOwner: "octocat",
-        repoName: "hello/world",
-      };
-
-      const result = CreateSessionRequestSchema.safeParse(invalid);
-      expect(result.success).toBe(false);
     });
   });
 });

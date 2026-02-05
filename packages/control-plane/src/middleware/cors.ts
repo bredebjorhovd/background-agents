@@ -69,17 +69,13 @@ export function getCorsOrigin(request: Request, env: Env): string | null {
 export function applyCorsHeaders(response: Response, origin: string | null): Response {
   if (!origin) return response;
 
-  const headers = new Headers(response.headers);
-  headers.set("Access-Control-Allow-Origin", origin);
-  headers.set("Access-Control-Allow-Credentials", "true");
-  headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  headers.set("Access-Control-Max-Age", "86400");
-  appendVary(headers, "Origin");
+  const corsResponse = new Response(response.body, response);
+  corsResponse.headers.set("Access-Control-Allow-Origin", origin);
+  corsResponse.headers.set("Access-Control-Allow-Credentials", "true");
+  corsResponse.headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  corsResponse.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  corsResponse.headers.set("Access-Control-Max-Age", "86400");
+  appendVary(corsResponse.headers, "Origin");
 
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
+  return corsResponse;
 }

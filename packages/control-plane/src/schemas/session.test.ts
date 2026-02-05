@@ -82,10 +82,40 @@ describe("CreateSessionRequestSchema", () => {
     expect(result.success).toBe(false);
   });
 
+  it("should reject repoOwner with consecutive hyphens", () => {
+    const invalid = {
+      repoOwner: "octo--cat",
+      repoName: "hello-world",
+    };
+
+    const result = CreateSessionRequestSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
   it("should reject invalid repoName characters", () => {
     const invalid = {
       repoOwner: "octocat",
       repoName: "hello/world",
+    };
+
+    const result = CreateSessionRequestSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it("should reject repoName with consecutive dots", () => {
+    const invalid = {
+      repoOwner: "octocat",
+      repoName: "hello..world",
+    };
+
+    const result = CreateSessionRequestSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it("should reject repoName ending with .git", () => {
+    const invalid = {
+      repoOwner: "octocat",
+      repoName: "hello-world.git",
     };
 
     const result = CreateSessionRequestSchema.safeParse(invalid);
