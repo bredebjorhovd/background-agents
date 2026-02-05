@@ -22,6 +22,20 @@ describe("CreateSessionRequestSchema", () => {
     expect(result.success).toBe(true);
   });
 
+  it("should trim title whitespace", () => {
+    const valid = {
+      repoOwner: "octocat",
+      repoName: "hello-world",
+      title: "  Fix login bug  ",
+    };
+
+    const result = CreateSessionRequestSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.title).toBe("Fix login bug");
+    }
+  });
+
   it("should accept minimal valid request", () => {
     const valid = {
       repoOwner: "octocat",
@@ -56,6 +70,26 @@ describe("CreateSessionRequestSchema", () => {
     if (!result.success) {
       expect(result.error.issues[0].message).toContain("name");
     }
+  });
+
+  it("should reject invalid repoOwner characters", () => {
+    const invalid = {
+      repoOwner: "-octo",
+      repoName: "hello-world",
+    };
+
+    const result = CreateSessionRequestSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it("should reject invalid repoName characters", () => {
+    const invalid = {
+      repoOwner: "octocat",
+      repoName: "hello/world",
+    };
+
+    const result = CreateSessionRequestSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
   });
 
   it("should reject invalid model", () => {
@@ -171,6 +205,18 @@ describe("UpdateSessionRequestSchema", () => {
 
     const result = UpdateSessionRequestSchema.safeParse(valid);
     expect(result.success).toBe(true);
+  });
+
+  it("should trim updated title", () => {
+    const valid = {
+      title: "  New title  ",
+    };
+
+    const result = UpdateSessionRequestSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.title).toBe("New title");
+    }
   });
 
   it("should accept empty object", () => {

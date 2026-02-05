@@ -14,6 +14,8 @@ import {
   isSandboxAuthRoute,
   verifySandboxAuth,
   requireInternalAuth,
+  getCorsOrigin,
+  applyCorsHeaders,
   // Session handlers
   handleListSessions,
   handleCreateSession,
@@ -222,17 +224,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
+  const corsOrigin = getCorsOrigin(request, env);
 
   // CORS preflight
   if (method === "OPTIONS") {
-    return new Response(null, {
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
-        "Access-Control-Max-Age": "86400",
-      },
-    });
+    return applyCorsHeaders(new Response(null, { status: 204 }), corsOrigin);
   }
 
   // Require authentication for non-public routes
@@ -253,24 +249,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
             // Sandbox auth passed, continue to route handler
           } else {
             // Both HMAC and sandbox auth failed
-            const corsHeaders = new Headers(sandboxAuthError.headers);
-            corsHeaders.set("Access-Control-Allow-Origin", "*");
-            return new Response(sandboxAuthError.body, {
-              status: sandboxAuthError.status,
-              statusText: sandboxAuthError.statusText,
-              headers: corsHeaders,
-            });
+            return applyCorsHeaders(sandboxAuthError, corsOrigin);
           }
         }
       } else {
         // Not a sandbox auth route, return HMAC auth error
-        const corsHeaders = new Headers(hmacAuthError.headers);
-        corsHeaders.set("Access-Control-Allow-Origin", "*");
-        return new Response(hmacAuthError.body, {
-          status: hmacAuthError.status,
-          statusText: hmacAuthError.statusText,
-          headers: corsHeaders,
-        });
+        return applyCorsHeaders(hmacAuthError, corsOrigin);
       }
     }
   }
@@ -283,20 +267,13 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (match) {
       try {
         const response = await route.handler(request, env, match);
-        // Create new response with CORS headers (original response may be immutable)
-        const corsHeaders = new Headers(response.headers);
-        corsHeaders.set("Access-Control-Allow-Origin", "*");
-        return new Response(response.body, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: corsHeaders,
-        });
+        return applyCorsHeaders(response, corsOrigin);
       } catch (e) {
         console.error("Route handler error:", e);
-        return error("Internal server error", 500);
+        return applyCorsHeaders(error("Internal server error", 500), corsOrigin);
       }
     }
   }
 
-  return error("Not found", 404);
+  return applyCorsHeaders(error("Not found", 404), corsOrigin);
 }
