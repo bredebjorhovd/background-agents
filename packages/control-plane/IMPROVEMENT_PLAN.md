@@ -1,8 +1,8 @@
 # Control-Plane Package Improvement Plan
 
-## Status: Phase 3 Complete ✅
+## Status: Phase 5 In Progress 🚧
 
-**Last Updated**: 2026-02-02 **Current Branch**: `feature/hexagonal-ports` **Commit**: `f93b135`
+**Last Updated**: 2026-02-05 **Current Branch**: `feature/security-hardening` **Commit**: `3a859d4`
 
 ---
 
@@ -13,13 +13,13 @@ on code quality, architecture, and test coverage.
 
 ### Goals
 
-| Metric           | Initial                | Target          | Current           |
-| ---------------- | ---------------------- | --------------- | ----------------- |
-| Test coverage    | ~15% (2 files)         | 80%             | ~80% (35 files)   |
-| Largest file     | 3,380 lines            | <800 lines      | 656 lines         |
-| Input validation | Manual if-checks       | Zod schemas     | ✅ Zod            |
-| CORS             | Wildcard (`*`)         | Origin-specific | Wildcard          |
-| Architecture     | Mixed responsibilities | Hexagonal       | ✅ Services/Repos |
+| Metric           | Initial                | Target          | Current               |
+| ---------------- | ---------------------- | --------------- | --------------------- |
+| Test coverage    | ~15% (2 files)         | 80%             | ~80% (35 files)       |
+| Largest file     | 3,380 lines            | <800 lines      | 656 lines             |
+| Input validation | Manual if-checks       | Zod schemas     | ✅ Zod + GitHub rules |
+| CORS             | Wildcard (`*`)         | Origin-specific | ✅ Origin-specific    |
+| Architecture     | Mixed responsibilities | Hexagonal       | ✅ Services/Repos     |
 
 ---
 
@@ -774,27 +774,26 @@ npm test -- --coverage
 
 **Estimated Duration**: 1 week **Goal**: Address security concerns
 
-### 5.1 CORS Improvements
+### 5.1 CORS Improvements ✅ COMPLETE
 
-**Current**: Wildcard CORS (`Access-Control-Allow-Origin: *`)
+**Current**: Origin allowlist (production + previews + dev)
 
 **Problem**: Allows any origin to make authenticated requests
 
-**Solution**: Origin-specific CORS with allowlist
+**Solution**: Origin-specific CORS with allowlist and Vary header
 
 ```typescript
 // src/middleware/cors.ts
 const ALLOWED_ORIGINS = [
   "https://open-inspect.vercel.app",
-  /^https:\/\/open-inspect-.*\.vercel\.app$/, // Preview deployments
-  ...(process.env.NODE_ENV === "development" ? ["http://localhost:5173"] : []),
+  /^https:\/\/open-inspect-.*\.vercel\.app$/,
 ];
 
-export function getCorsOrigin(request: Request): string | null {
+export function getCorsOrigin(request: Request, env: Env): string | null {
   const origin = request.headers.get("Origin");
   if (!origin) return null;
 
-  const isAllowed = ALLOWED_ORIGINS.some((pattern) =>
+  const isAllowed = getAllowedOrigins(env).some((pattern) =>
     typeof pattern === "string" ? pattern === origin : pattern.test(origin)
   );
 
@@ -804,18 +803,15 @@ export function getCorsOrigin(request: Request): string | null {
 export function applyCorsHeaders(response: Response, origin: string | null): Response {
   if (!origin) return response;
 
-  const headers = new Headers(response.headers);
-  headers.set("Access-Control-Allow-Origin", origin);
-  headers.set("Access-Control-Allow-Credentials", "true");
-  headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  headers.set("Access-Control-Max-Age", "86400"); // 24 hours
+  const corsResponse = new Response(response.body, response);
+  corsResponse.headers.set("Access-Control-Allow-Origin", origin);
+  corsResponse.headers.set("Access-Control-Allow-Credentials", "true");
+  corsResponse.headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  corsResponse.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  corsResponse.headers.set("Access-Control-Max-Age", "86400");
+  appendVary(corsResponse.headers, "Origin");
 
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
+  return corsResponse;
 }
 ```
 
@@ -824,7 +820,7 @@ export function applyCorsHeaders(response: Response, origin: string | null): Res
 ```typescript
 // src/router.ts
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
-  const origin = getCorsOrigin(request);
+  const origin = getCorsOrigin(request, env);
 
   // Handle preflight
   if (request.method === "OPTIONS") {
@@ -950,7 +946,7 @@ export async function createSession(request: Request, env: Env): Promise<Respons
 }
 ```
 
-### 5.3 Input Sanitization
+### 5.3 Input Sanitization ✅ COMPLETE
 
 **Already addressed in Phase 1** via Zod schemas, but add specific checks:
 
@@ -962,12 +958,12 @@ export const CreateSessionRequestSchema = z
       .string()
       .min(1)
       .max(39) // GitHub max username length
-      .regex(/^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/, "Invalid GitHub username"),
+      .regex(/^(?!.*--)[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/, "Invalid GitHub username"),
     repoName: z
       .string()
       .min(1)
       .max(100) // GitHub max repo name length
-      .regex(/^[a-zA-Z0-9._-]+$/, "Invalid repository name"),
+      .regex(/^(?!.*\.\.)(?!.*\.git$)[a-zA-Z0-9._-]+$/, "Invalid repository name"),
     title: z
       .string()
       .max(200)
@@ -978,7 +974,7 @@ export const CreateSessionRequestSchema = z
   .strict();
 ```
 
-### 5.4 Security Tests
+### 5.4 Security Tests ✅ COMPLETE
 
 ```typescript
 // src/security.test.ts
@@ -1011,30 +1007,24 @@ describe("Security", () => {
   });
 
   describe("Input Validation", () => {
-    it("should reject SQL injection attempts", async () => {
-      const malicious = {
-        repoOwner: "'; DROP TABLE session; --",
+    it("should reject invalid repo owner", async () => {
+      const invalid = {
+        repoOwner: "-octo",
         repoName: "hello-world",
       };
 
-      const result = CreateSessionRequestSchema.safeParse(malicious);
+      const result = CreateSessionRequestSchema.safeParse(invalid);
       expect(result.success).toBe(false);
     });
 
-    it("should reject XSS attempts", async () => {
-      const malicious = {
+    it("should reject invalid repo name", async () => {
+      const invalid = {
         repoOwner: "octocat",
-        repoName: "hello-world",
-        title: "<script>alert('xss')</script>",
+        repoName: "hello/world",
       };
 
-      const result = CreateSessionRequestSchema.safeParse(malicious);
-      expect(result.success).toBe(true);
-
-      // Title should be sanitized (trimmed, but not HTML-escaped since we don't render it)
-      if (result.success) {
-        expect(result.data.title).not.toContain("<script>");
-      }
+      const result = CreateSessionRequestSchema.safeParse(invalid);
+      expect(result.success).toBe(false);
     });
   });
 
@@ -1204,14 +1194,18 @@ git commit -m "refactor SessionDO and add rate limiting"
   - PRCreator uses GitHubPort with updated tests
   - SessionDO injects ports for external dependencies
 
+- ✅ **Phase 5 (partial)**: Security Hardening (2026-02-05)
+  - CORS allowlist middleware with origin-specific headers
+  - Tightened GitHub owner/repo validation rules
+  - Security tests focused on CORS allowlist
+
 ### In Progress
 
-- 🚧 None
+- 🚧 **Phase 5**: Security Hardening (Rate Limiting)
 
 ### Upcoming
 
 - ⏳ **Phase 4**: Test Coverage Expansion
-- ⏳ **Phase 5**: Security Hardening
 
 ### Metrics
 
