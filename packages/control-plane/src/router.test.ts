@@ -35,12 +35,15 @@ describe("router authentication", () => {
     it("should return correct CORS headers for OPTIONS request", async () => {
       const request = new Request("https://example.com/sessions", {
         method: "OPTIONS",
+        headers: { Origin: "https://open-inspect.vercel.app" },
       });
 
       const response = await handleRequest(request, mockEnv);
 
-      expect(response.status).toBe(200);
-      expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(response.status).toBe(204);
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        "https://open-inspect.vercel.app"
+      );
       expect(response.headers.get("Access-Control-Allow-Methods")).toBe(
         "GET, POST, PUT, DELETE, OPTIONS"
       );
@@ -53,12 +56,15 @@ describe("router authentication", () => {
     it("should return CORS headers for protected route OPTIONS", async () => {
       const request = new Request("https://example.com/sessions/123", {
         method: "OPTIONS",
+        headers: { Origin: "https://open-inspect.vercel.app" },
       });
 
       const response = await handleRequest(request, mockEnv);
 
-      expect(response.status).toBe(200);
-      expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(response.status).toBe(204);
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        "https://open-inspect.vercel.app"
+      );
     });
   });
 
@@ -77,11 +83,15 @@ describe("router authentication", () => {
     });
 
     it("should return CORS headers for public routes", async () => {
-      const request = new Request("https://example.com/health");
+      const request = new Request("https://example.com/health", {
+        headers: { Origin: "https://open-inspect.vercel.app" },
+      });
 
       const response = await handleRequest(request, mockEnv);
 
-      expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        "https://open-inspect.vercel.app"
+      );
     });
   });
 
@@ -175,12 +185,16 @@ describe("router authentication", () => {
     });
 
     it("should include CORS headers in auth error responses", async () => {
-      const request = new Request("https://example.com/sessions");
+      const request = new Request("https://example.com/sessions", {
+        headers: { Origin: "https://open-inspect.vercel.app" },
+      });
 
       const response = await handleRequest(request, mockEnv);
 
       expect(response.status).toBe(401);
-      expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        "https://open-inspect.vercel.app"
+      );
     });
   });
 
@@ -337,20 +351,22 @@ describe("router authentication", () => {
       expect(data.error).toBe("Not found");
     });
 
-    it("should return 404 for unknown routes (note: CORS headers missing - known issue)", async () => {
+    it("should return 404 for unknown routes with CORS headers", async () => {
       const token = await generateInternalToken(testSecret);
 
       const request = new Request("https://example.com/unknown-route", {
         headers: {
           Authorization: `Bearer ${token}`,
+          Origin: "https://open-inspect.vercel.app",
         },
       });
 
       const response = await handleRequest(request, mockEnv);
 
       expect(response.status).toBe(404);
-      // TODO: CORS headers should be added to 404 responses
-      // expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+        "https://open-inspect.vercel.app"
+      );
     });
   });
 

@@ -10,9 +10,21 @@ import { MODEL_SCHEMA } from "./common";
  */
 export const CreateSessionRequestSchema = z
   .object({
-    repoOwner: z.string().min(1, "Repository owner is required"),
-    repoName: z.string().min(1, "Repository name is required"),
-    title: z.string().max(200).optional(),
+    repoOwner: z
+      .string()
+      .min(1, "Repository owner is required")
+      .max(39, "Repository owner must be 39 characters or fewer")
+      .regex(/^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/, "Invalid GitHub owner name"),
+    repoName: z
+      .string()
+      .min(1, "Repository name is required")
+      .max(100, "Repository name must be 100 characters or fewer")
+      .regex(/^[a-zA-Z0-9._-]+$/, "Invalid repository name"),
+    title: z
+      .string()
+      .max(200)
+      .transform((value) => value.trim())
+      .optional(),
     model: MODEL_SCHEMA.optional(),
   })
   .strict();
@@ -47,7 +59,11 @@ export type SessionPromptRequest = z.infer<typeof SessionPromptRequestSchema>;
  */
 export const UpdateSessionRequestSchema = z
   .object({
-    title: z.string().max(200).optional(),
+    title: z
+      .string()
+      .max(200)
+      .transform((value) => value.trim())
+      .optional(),
   })
   .strict();
 
